@@ -1,10 +1,10 @@
 # The classes in this file are adapted from the E(n) EGNN software corresponding
 # to this paper: <https://arxiv.org/abs/2102.09844v3>
 
-from torch import nn
 import torch
+from torch import nn
 
-from src.utils.graph_utils import unsorted_segment_sum, unsorted_segment_mean
+from t_alpha.utils.graph_utils import unsorted_segment_mean, unsorted_segment_sum
 
 
 class E_GCL(nn.Module):
@@ -333,17 +333,17 @@ class E_GCL(nn.Module):
 class EGNN(nn.Module):
     def __init__(
         self,
-        in_node_nf,
-        hidden_nf,
-        out_node_nf,
-        in_edge_nf=0,
-        device="cpu",
-        act_fn=nn.SiLU(),
-        n_layers=4,
-        residual=True,
-        attention=False,
-        normalize=False,
-        tanh=False,
+        device: str,
+        in_node_nf: int,
+        hidden_nf: int,
+        out_node_nf: int,
+        in_edge_nf: int = 0,
+        act_fn: nn.Module = nn.SiLU(),
+        n_layers: int = 4,
+        residual: bool = True,
+        attention: bool = False,
+        normalize: bool = False,
+        tanh: bool = False,
     ):
         """
         :param in_node_nf: Number of input node features (e.g., atom types in a molecule).

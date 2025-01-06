@@ -1,16 +1,17 @@
-import torch
 import os
-from torch_geometric.loader import DataListLoader
-from torch_geometric.data import Data, Batch
+
 import numpy as np
 import pandas as pd
+import torch
+from torch_geometric.data import Batch, Data
+from torch_geometric.loader import DataListLoader
 
-from src.data.full_model_dataset import MetaModelDataset
-from src.models.full_model import MetaModel
-from src.training.lightning_module import MetaModelLightning
+from t_alpha.data.full_model_dataset import MetaModelDataset
+from t_alpha.models.full_model import MetaModel
+from t_alpha.training.lightning_module import MetaModelLightning
 
 
-def enable_dropout(model):
+def enable_dropout(model: torch.nn.Module) -> None:
     """
     Enable dropout layers during inference by setting them to training mode.
 
@@ -23,28 +24,28 @@ def enable_dropout(model):
 
 
 def perform_mc_dropout(
-    ckpt_path,
-    test_set_path,
-    batch_size=8,
-    batch_norm=True,
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    num_mc_samples=100,
+    ckpt_path: str,
+    test_set_path: str,
+    batch_size: int = 8,
+    batch_norm: bool = True,
+    device: str = "cpu",
+    num_mc_samples: int = 100,
 ):
     """
     Perform Monte Carlo Dropout.
 
     Args:
-        ckpt_path (str): Path to the checkpoint file (.ckpt).
-        test_set_path (str): Path to the test dataset.
-        batch_size (int, optional): Batch size for DataLoader. Defaults to 8.
-        batch_norm (bool, optional): Whether to use batch normalization. Defaults to True.
-        device (str, optional): Device to perform inference on ('cuda' or 'cpu').
+        ckpt_path: Path to the checkpoint file (.ckpt).
+        test_set_path: Path to the test dataset.
+        batch_size: Batch size for DataLoader. Defaults to 8.
+        batch_norm: Whether to use batch normalization. Defaults to True.
+        device: Device to perform inference on ('cuda' or 'cpu').
                                 Defaults to 'cuda' if available.
-        num_mc_samples (int, optional): Number of Monte Carlo samples for uncertainty estimation.
-                                        Defaults to 100.
+        num_mc_samples: Number of Monte Carlo samples for uncertainty estimation.
+                       Defaults to 100.
 
     Returns:
-        pd.DataFrame: A DataFrame containing pdbid, prediction, and uncertainty for each sample.
+        A DataFrame containing pdbid, prediction, and uncertainty for each sample.
     """
     # Verify that ckpt_path is a file
     if not os.path.isfile(ckpt_path):

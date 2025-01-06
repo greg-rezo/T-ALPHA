@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t_alpha"
+requires-python = "~= 3.10.0"
+version = "0.1.0"
+
+dependencies = [
+    "biopandas~=0.5",
+    "biopython~=1.81",
+    "h5py~=3.12",
+    "matplotlib~=3.10",
+    "networkx~=3.4",
+    "numpy<2",
+    "openbabel-wheel~=3.1",
+    "pandas~=2.2",
+    "pillow~=11.0",
+    "py3Dmol~=2.4",
+    "pykeops~=2.2",
+    "pytorch-lightning~=2.4",
+    "PyYAML~=6.0",
+    "rdkit~=2023.9.3",
+    "requests~=2.32",
+    "scikit-learn~=1.6",
+    "torch>=2.2",
+    "torch-geometric~=2.6",
+    "torchmetrics~=1.6",
+    "tqdm~=4.67",
+]
+
+[project.entry-points."console_scripts"]
+inference = "t_alpha.scripts.inference:main"
+gen_hdf5 = "t_alpha.scripts.gen_hdf5:main"
+mc_dropout = "t_alpha.scripts.mc_dropout:main"
+train = "t_alpha.scripts.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src/"]
+include = [
+  "t_alpha.*"
+]
+
+
+[tool.setuptools.package-data]
+"t_alpha.data_scalers" = ["*.pkl"]

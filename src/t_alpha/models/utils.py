@@ -17,7 +17,6 @@ class AttentionPooling(nn.Module):
 
 
 def masked_mean_pool(x, mask):
-
     # Expand mask to match feature dimensions
     mask = mask.unsqueeze(-1).float()  # [batch_size, max_num_nodes, 1]
 

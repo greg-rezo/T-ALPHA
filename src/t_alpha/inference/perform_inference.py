@@ -1,24 +1,25 @@
-import torch
 import os
-from torch_geometric.loader import DataListLoader
-from torch_geometric.data import Data, Batch
-import pandas as pd
-import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from scipy.stats import pearsonr, spearmanr
-import matplotlib.pyplot as plt
 
-from src.data.full_model_dataset import MetaModelDataset
-from src.models.full_model import MetaModel
-from src.training.lightning_module import MetaModelLightning
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from torch_geometric.data import Batch, Data
+from torch_geometric.loader import DataListLoader
+
+from t_alpha.data.full_model_dataset import MetaModelDataset
+from t_alpha.models.full_model import MetaModel
+from t_alpha.training.lightning_module import MetaModelLightning
 
 
 def perform_inference(
-    ckpt_path,
-    test_set_path,
-    batch_size=32,
-    batch_norm=True,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    ckpt_path: str,
+    test_set_path: str,
+    batch_size: int = 32,
+    batch_norm: bool = True,
+    device: str = "cpu",
 ):
     """
     Perform inference.

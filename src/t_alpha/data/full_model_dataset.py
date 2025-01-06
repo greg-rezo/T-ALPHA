@@ -1,7 +1,7 @@
-from torch.utils.data import Dataset
 import h5py
 import numpy as np
 import torch
+from torch.utils.data import Dataset
 from torch_geometric.data import Data
 
 
@@ -22,7 +22,7 @@ class MetaModelDataset(Dataset):
         __getitem__(idx): Retrieves and processes a single data point from the HDF5 file.
     """
 
-    def __init__(self, data_h5_file, device="cpu"):
+    def __init__(self, data_h5_file: str, device: str):
         super(MetaModelDataset, self).__init__()
         with h5py.File(data_h5_file, "r") as file:
             self.keys = list(file.keys())
@@ -34,7 +34,6 @@ class MetaModelDataset(Dataset):
         return len(self.keys)
 
     def __getitem__(self, idx):
-
         with h5py.File(self.data_h5_file, "r") as f:
             group = self.keys[idx]
             atom_coords = f[group]["protein_nodes_withH_coords"][:]

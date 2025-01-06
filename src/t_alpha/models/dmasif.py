@@ -1,16 +1,16 @@
 # The class in this file is adapted from the dMaSIF software corresponding
 # to this paper: <https://www.biorxiv.org/content/10.1101/2020.12.28.424589v1.full>
 
-import torch.nn as nn
 import torch
+import torch.nn as nn
 
-from src.models.atomnet import AtomNet_MP
-from src.models.dmasif_conv import dMaSIFConv_seg
-from src.utils.geometry import curvatures
+from t_alpha.models.atomnet import AtomNet_MP
+from t_alpha.models.dmasif_conv import dMaSIFConv_seg
+from t_alpha.utils.geometry import curvatures
 
 
 class dMaSIF(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: dict):
         super(dMaSIF, self).__init__()
         # Additional geometric features: mean and Gauss curvatures computed at different scales.
         self.curvature_scales = config["curvature_scales"]
@@ -41,7 +41,7 @@ class dMaSIF(nn.Module):
             radius=config["radius"],
         )
 
-    def features(self, P):
+    def features(self, P: dict) -> torch.Tensor:
         """Estimates geometric and chemical features from a protein surface or a cloud of atoms."""
 
         # Estimate the curvatures using the estimated normals
@@ -65,7 +65,7 @@ class dMaSIF(nn.Module):
         # shape is (num_points_in_batch, num_atomic_features+2*num_scales)...2*num_scales since its the mean curvature and gaussian curve at each scale
         return torch.cat([P_curvatures, chemfeats], dim=1).contiguous()
 
-    def forward(self, P):
+    def forward(self, P: dict) -> dict:
         """Embeds all points of a protein in a high-dimensional vector space."""
 
         # Returns the full feature embedding for each surface point by concatenating chemical and geometric features
