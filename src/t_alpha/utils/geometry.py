@@ -1,12 +1,17 @@
 # The functions in this file are adapted from the dMaSIF software corresponding
 # to this paper: <https://www.biorxiv.org/content/10.1101/2020.12.28.424589v1.full>
 
-from pykeops.torch import LazyTensor
 import torch
 import torch.nn.functional as F
+from pykeops.torch import LazyTensor
 
 
-def calculate_smoothed_normals(point_coords, scales=[1.0], batch=None, normals=None):
+def calculate_smoothed_normals(
+    point_coords: torch.Tensor,
+    scales_list: list[float] = [1.0],
+    batch: torch.Tensor | None = None,
+    normals: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Returns a smooth field of normals, possibly at different scales.
 
     points, normals, scale(s)  ->      normals
@@ -30,7 +35,7 @@ def calculate_smoothed_normals(point_coords, scales=[1.0], batch=None, normals=N
 
     # different scales to pass the Gaussian window over
     # shape (S,)
-    scales = torch.Tensor(scales).type_as(point_coords)
+    scales = torch.tensor(scales_list, device=point_coords.device).type_as(point_coords)
 
     # Normal of a vertex = average of all normals in a ball of size "scale":
 

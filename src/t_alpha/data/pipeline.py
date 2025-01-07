@@ -1647,7 +1647,7 @@ def soft_distances(x, y, batch_x, batch_y, smoothness=0.5, atomtypes=None):
     D_ij.ranges = diagonal_ranges(batch_x, batch_y)
 
     if atomtypes is not None:
-        atomic_radii = torch.FloatTensor(
+        atomic_radii = torch.tensor(
             [
                 120,  # Hydrogen
                 170,  # Carbon
@@ -1662,6 +1662,7 @@ def soft_distances(x, y, batch_x, batch_y, smoothness=0.5, atomtypes=None):
                 198,  # Iodine
                 190,  # the average vdw radius of the atoms present in the dataset not included in this list
             ],
+            dtype=torch.float32,
             device=x.device,
         )
 
@@ -2290,7 +2291,7 @@ def run_single_inference(
 def run(
     protein_file: Path,
     ligand_file: Path,
-    esm_model: str = "esm2_t36_3B_UR50D",
+    esm_model_name: ESMModel,
     t_alpha_model_parameters_file: Path = Path("T-ALPHA_params.ckpt"),
     smiles_transformer_model_parameters_file: Path = Path(
         "SMILES_transformer_params.pt"
@@ -2331,7 +2332,7 @@ def run(
     Parameters:
         protein_file: Path to the protein file.
         ligand_file: Path to the ligand file.
-        esm_model: ESM model name
+        esm_model_name: ESM model name
         t_alpha_model_parameters_file: Path to the model parameters file.
         smiles_transformer_model_parameters_file: Path to the model parameters file.
         smiles_transformer_training_data_file: Path to the training data file.
@@ -2369,7 +2370,7 @@ def run(
 
     # Extract ESM2 embedding
     protein_seq = _protein_mol_to_seq(protein_molecule)
-    esm2_embedding = _get_esm2_embedding(protein_seq, esm_model)
+    esm2_embedding = _get_esm2_embedding(protein_seq, esm_model_name)
 
     # Extract RDKit 2D descriptor vector
     rdkit_mol = _pybel_mol_to_rdkit_mol(ligand_molecule)

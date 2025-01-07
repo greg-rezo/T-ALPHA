@@ -25,7 +25,7 @@ def main(args):
     run(
         protein_file=args.protein_file,
         ligand_file=args.ligand_file,
-        esm_model=args.esm_model,
+        esm_model_name=args.esm_model,
         calc_surface_features=True,
     )
 
