@@ -7,6 +7,7 @@ import pickle
 import random
 import re
 import tempfile
+from enum import Enum
 from pathlib import Path
 from typing import cast
 
@@ -41,6 +42,13 @@ SRC_ROOT = Path(__file__).parent.parent
 DATA_SCALERS_BASE = "t_alpha.data_scalers"
 
 logger = logging.getLogger(__name__)
+
+
+class ESMModel(Enum):
+    ESM2_T36_15B_UR50D = "esm2_t36_15B_UR50D"
+    ESM2_T36_3B_UR50D = "esm2_t36_3B_UR50D"
+    ESM2_T36_650M_UR50D = "esm2_t33_650M_UR50D"
+    ESM2_T30_150M_UR50D = "esm2_t30_150M_UR50D"
 
 
 class TransformerDataset(Dataset):
@@ -452,7 +460,7 @@ def _protein_mol_to_seq(protein_molecule: Molecule) -> str:
     return seq
 
 
-def _get_esm2_embedding(seq: str, esm_model_name: str) -> np.ndarray:
+def _get_esm2_embedding(seq: str, esm_model_name: ESMModel) -> np.ndarray:
     """
     Given a protein sequence across all protein chains, produce the ESM2 embedding for
     that combined sequence.
@@ -475,7 +483,7 @@ def _get_esm2_embedding(seq: str, esm_model_name: str) -> np.ndarray:
 
     logger.info(f"Loading ESM2 model from huggingface: {esm_model_name}")
     esm_model, esm_alphabet = torch.hub.load(
-        "facebookresearch/esm:main", esm_model_name
+        "facebookresearch/esm:main", esm_model_name.value
     )
 
     # Convert the single protein sequence into tokens
@@ -1436,12 +1444,12 @@ def _get_graphs(
     return (
         protein_coords,
         protein_features,
-        prot_edges,
-        prot_attrs,
+        np.array(prot_edges),
+        np.array(prot_attrs),
         ligand_coords,
         ligand_features,
-        lig_edges,
-        lig_attrs,
+        np.array(lig_edges),
+        np.array(lig_attrs),
         complex_coords,
         complex_features,
         complex_edges,
@@ -1707,7 +1715,7 @@ def subsample(x, batch=None, scale=1.0):
 
         # We append a "1" to the input vectors, in order to
         # compute both the numerator and denominator of the "average"
-        #  fraction in one pass through the data.
+        #  fraction in one pass through the data.
         x_1 = torch.cat((x, torch.ones_like(x[:, :1])), dim=1)
         D = x_1.shape[1]
         points = torch.zeros_like(x_1[:C])
@@ -2122,8 +2130,8 @@ def run_single_inference(
     protein_coords: np.ndarray,
     protein_atom_types: np.ndarray,
     scaled_protein_features: np.ndarray,
-    protein_surface_coords: torch.Tensor,
-    protein_surface_norms: torch.Tensor,
+    protein_surface_coords: torch.Tensor | None,
+    protein_surface_norms: torch.Tensor | None,
     scaled_rdkit_vector: np.ndarray,
     scaled_transformer_embedding: np.ndarray,
     scaled_ligand_features: np.ndarray,
@@ -2134,6 +2142,7 @@ def run_single_inference(
     complex_coords: np.ndarray,
     complex_edges: np.ndarray,
     scaled_complex_edge_attrs: np.ndarray,
+    calc_surface_features: bool,
     device: str,
 ) -> float:
     """
@@ -2167,15 +2176,22 @@ def run_single_inference(
     atom_features = to_tensor(
         np.concatenate([protein_atom_types, scaled_protein_features], axis=1)
     )  # shape [N_atoms, D]
-    surface_coords = to_tensor(protein_surface_coords)  # shape [N_surf, 3]
-    surface_normals = to_tensor(protein_surface_norms)  # shape [N_surf, 3]
+
+    if calc_surface_features:
+        surface_coords = to_tensor(protein_surface_coords)  # shape [N_surf, 3]
+        surface_normals = to_tensor(protein_surface_norms)  # shape [N_surf, 3]
+
+        surface_batch_idx = torch.zeros(
+            surface_coords.size(0), dtype=torch.long, device=device
+        )
+    else:
+        surface_coords = None
+        surface_normals = None
+        surface_batch_idx = None
 
     # For a single sample, all batch indices are 0
     atom_coords_batch = torch.zeros(
         atom_coords.size(0), dtype=torch.long, device=device
-    )
-    surface_batch_idx = torch.zeros(
-        surface_coords.size(0), dtype=torch.long, device=device
     )
 
     # Protein graph
@@ -2241,7 +2257,16 @@ def run_single_inference(
 
     # Load the model
     logger.info("Loading model from checkpoint")
-    model = MetaModel(device=device)
+    model = MetaModel(
+        device=device,
+        use_protein_graph=True,
+        use_protein_surface=calc_surface_features,
+        use_protein_sequence=True,
+        use_ligand_properties=True,
+        use_ligand_graph=True,
+        use_ligand_sequence=True,
+        use_complex_graph=True,
+    )
     lightning_model = MetaModelLightning.load_from_checkpoint(
         train_dataset=None,
         val_dataset=None,
@@ -2278,6 +2303,7 @@ def run(
     ligand_sequence_scaler_name: str = "ligand_sequence_scaler.pkl",
     protein_sequence_scaler_name: str = "protein_sequence_scaler.pkl",
     ligand_properties_scaler_name: str = "ligand_properties_scaler.pkl",
+    calc_surface_features: bool = True,
     device: str | None = None,
 ):
     """
@@ -2314,6 +2340,7 @@ def run(
         ligand_sequence_scaler_name: Path to the ligand sequence scaler file.
         protein_sequence_scaler_name: Path to the protein sequence scaler file.
         ligand_properties_scaler_name: Path to the ligand properties scaler file.
+        calc_surface_features: Whether to calculate surface features.
         device: The device to use for computation.
     """
     if device is None:
@@ -2396,15 +2423,18 @@ def run(
     }
 
     # Obtain surface coordinates and normals
-    protein_surface_coords_tensor, protein_surface_norms_tensor = (
-        _process_surface_features(data, device=device)
-    )
+    if calc_surface_features:
+        protein_surface_coords_tensor, protein_surface_norms_tensor = (
+            _process_surface_features(data, device=device)
+        )
+    else:
+        protein_surface_coords_tensor = None
+        protein_surface_norms_tensor = None
 
     # Scale the featurized connected graphs
     with importlib.resources.path(
         DATA_SCALERS_BASE, connected_graph_scaler_name
     ) as connected_graph_scaler_file:
-        # Now you can read from pkl_path as needed
         (
             scaled_ligand_features,
             scaled_ligand_edge_attrs,
@@ -2491,6 +2521,7 @@ def run(
             complex_coords=complex_coords,
             complex_edges=complex_edges,
             scaled_complex_edge_attrs=scaled_complex_edge_attrs,
+            calc_surface_features=calc_surface_features,
             device=device,
         )
         logger.info(f"Prediction: {prediction}")

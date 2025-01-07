@@ -220,7 +220,9 @@ class MetaModel(nn.Module):
 
         if self.use_ligand_graph:
             # ligand graph model
-            self.ligand_graph_model = EGNNEncoder(in_node_nf=27, n_layers=4)
+            self.ligand_graph_model = EGNNEncoder(
+                device=device, in_node_nf=27, n_layers=4
+            )
             # ligand graph transformer output embedding layer
             self.ligand_graph_transformer_output_embedding_layer = nn.Linear(1, 512)
 
@@ -252,7 +254,7 @@ class MetaModel(nn.Module):
         if self.use_complex_graph:
             # complex graph model
             self.complex_graph_model = EGNNEncoder(
-                in_node_nf=33, n_layers=8, in_edge_nf=7
+                device=device, in_node_nf=33, n_layers=8, in_edge_nf=7
             )
 
             # complex graph embedding layer
