@@ -13,7 +13,7 @@ def parse_args():
     parser.add_argument("--protein_file", type=Path, required=True)
     parser.add_argument("--ligand_file", type=Path, required=True)
     parser.add_argument(
-        "--esm_model", type=ESMModel, default=ESMModel.ESM2_T36_650M_UR50D
+        "--esm_model", type=ESMModel, default=ESMModel.ESM2_T36_3B_UR50D
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args()
