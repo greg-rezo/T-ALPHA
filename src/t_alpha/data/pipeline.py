@@ -4,12 +4,11 @@ import importlib.resources
 import logging
 import math
 import pickle
-import random
 import re
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
 import numpy as np
 import pandas as pd
@@ -21,6 +20,7 @@ from biopandas.mol2 import PandasMol2
 from biopandas.pdb import PandasPdb
 from openbabel import openbabel, pybel
 from openbabel.pybel import Molecule
+from pydantic import BaseModel
 from pykeops.torch import LazyTensor
 from pykeops.torch.cluster import grid_cluster
 from rdkit.Chem import Descriptors, Mol
@@ -30,8 +30,8 @@ from rdkit.Chem.rdmolfiles import (
 )
 from rdkit.ML.Descriptors import MoleculeDescriptors  # type: ignore
 from sklearn.discriminant_analysis import StandardScaler
+from smart_open import open as smart_open
 from torch.nn import functional as F
-from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 
 from t_alpha.models.full_model import MetaModel
@@ -39,7 +39,7 @@ from t_alpha.training.lightning_module import MetaModelLightning
 from t_alpha.utils.checkpoint_utils import update_parameter_keys
 
 SRC_ROOT = Path(__file__).parent.parent
-DATA_SCALERS_BASE = "t_alpha.data_scalers"
+RESOURCES_BASE = "t_alpha.resources"
 
 logger = logging.getLogger(__name__)
 
@@ -51,99 +51,131 @@ class ESMModel(Enum):
     ESM2_T30_150M_UR50D = "esm2_t30_150M_UR50D"
 
 
-class TransformerDataset(Dataset):
-    """
-    Dataset class for the Transformer model.
+class SMILESTransformerVocab(BaseModel):
+    vocab: list[str]
+    stoi: dict[str, int]
+    block_size: int
 
-    Args:
-        data_file: The path to the data file.
-        block_size: The block size for padding the sequences.
+    smiles_regex: ClassVar[re.Pattern] = re.compile(
+        r"(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9]|<MASK>|<pad>|[CLS]|[EOS])"
+    )
 
-    Attributes:
-        smiles: The SMILES data from the dataset.
-        smiles_regex: The regular expression pattern for tokenizing SMILES strings.
-        vocab: The vocabulary of special tokens and characters.
-        stoi: A mapping of characters to their corresponding indices in the vocabulary.
-        itos: A mapping of indices to their corresponding characters in the vocabulary.
-        block_size: The block size for padding the sequences.
+    @property
+    def itos(self) -> dict[int, str]:
+        return {i: ch for i, ch in enumerate(self.vocab)}
 
-    Methods:
-        __len__(): Returns the length of the dataset.
-        __getitem__(idx): Returns the item at the given index.
-
-    """
-
-    def __init__(self, data_file: Path, block_size: int = 155):
-        # Retrieve the SMILES strings from the data file
-        data = pd.read_csv(data_file)
-        self.smiles = data["SMILES"]
-
-        # Tokenize the SMILES strings
-        self.smiles_regex = re.compile(
-            r"(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9]|<MASK>|<pad>|[CLS]|[EOS])"
-        )
+    @classmethod
+    def from_smiles(
+        cls, smiles: list[str], block_size: int = 155
+    ) -> "SMILESTransformerVocab":
         special_tokens = {"<MASK>", "<pad>", "[CLS]", "[EOS]"}
 
-        # Build the vocabulary
         characters = {
-            ch
-            for smile in self.smiles
-            for ch in self.smiles_regex.findall(smile.strip())
+            ch for smile in smiles for ch in cls.smiles_regex.findall(smile.strip())
         }
-        self.vocab = sorted(list(special_tokens | characters))
+        vocab = sorted(list(special_tokens | characters))
+        stoi = {ch: i for i, ch in enumerate(vocab)}
 
-        # Create mappings for the vocabulary
-        self.stoi = {ch: i for i, ch in enumerate(self.vocab)}
-        self.itos = {i: ch for i, ch in enumerate(self.vocab)}
-
-        self.block_size = 2 + block_size
-
-    # Method to return the length of the dataset
-    def __len__(self) -> int:
-        return len(self.smiles)
-
-    # Method to return the item at the given index
-    def __getitem__(self, idx) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Tokenize the SMILES string and pad it to the block size
-        smiles = "[CLS]" + self.smiles[idx].strip() + "[EOS]"
-        smiles_tokens = self.smiles_regex.findall(smiles)
-        smiles += "<pad>" * (self.block_size - len(smiles_tokens))
-
-        # Retrieve the token indices
-        true_token_idx = [self.stoi[s] for s in self.smiles_regex.findall(smiles)]
-
-        # Mask the tokens
-        mask_idx = []
-        for s in range(len(smiles_tokens)):
-            if random.random() < 0.15:
-                mask_idx.append(False)
-                num = random.random()
-                if num >= 0.2:
-                    smiles_tokens[s] = "<MASK>"
-                elif num >= 0.1:
-                    smiles_tokens[s] = self.vocab[
-                        int(random.random() * len(self.vocab))
-                    ]
-            else:
-                mask_idx.append(True)
-
-        # Identify the masked tokens
-        mask_idx += [True] * (self.block_size - len(mask_idx))
-        masked_smiles = "".join(smiles_tokens)
-
-        # Pad to the block size
-        masked_smiles += "<pad>" * (
-            self.block_size - len(self.smiles_regex.findall(masked_smiles))
+        return cls(
+            vocab=vocab,
+            stoi=stoi,
+            block_size=block_size + 2,
         )
-        masked_token_idx = [
-            self.stoi[s] for s in self.smiles_regex.findall(masked_smiles)
-        ]
 
-        return (
-            torch.tensor(masked_token_idx, dtype=torch.long),
-            torch.tensor(true_token_idx, dtype=torch.long),
-            torch.tensor(mask_idx),
-        )
+
+# class TransformerDataset(Dataset):
+#     """
+#     Dataset class for the Transformer model.
+
+#     Args:
+#         data_file: The path to the data file.
+#         block_size: The block size for padding the sequences.
+
+#     Attributes:
+#         smiles: The SMILES data from the dataset.
+#         smiles_regex: The regular expression pattern for tokenizing SMILES strings.
+#         vocab: The vocabulary of special tokens and characters.
+#         stoi: A mapping of characters to their corresponding indices in the vocabulary.
+#         itos: A mapping of indices to their corresponding characters in the vocabulary.
+#         block_size: The block size for padding the sequences.
+
+#     Methods:
+#         __len__(): Returns the length of the dataset.
+#         __getitem__(idx): Returns the item at the given index.
+
+#     """
+
+#     def __init__(self, data_file: Path, block_size: int = 155):
+#         # Retrieve the SMILES strings from the data file
+#         data = pd.read_parquet(data_file)
+#         self.smiles = data["SMILES"]
+
+#         # Tokenize the SMILES strings
+#         self.smiles_regex = re.compile(
+#             r"(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9]|<MASK>|<pad>|[CLS]|[EOS])"
+#         )
+#         special_tokens = {"<MASK>", "<pad>", "[CLS]", "[EOS]"}
+
+#         # # Build the vocabulary
+#         characters = {
+#             ch
+#             for smile in self.smiles
+#             for ch in self.smiles_regex.findall(smile.strip())
+#         }
+#         self.vocab = sorted(list(special_tokens | characters))
+
+#         # Create mappings for the vocabulary
+#         self.stoi = {ch: i for i, ch in enumerate(self.vocab)}
+#         self.itos = {i: ch for i, ch in enumerate(self.vocab)}
+
+#         self.block_size = 2 + block_size
+
+#     # Method to return the length of the dataset
+#     def __len__(self) -> int:
+#         return len(self.smiles)
+
+#     # Method to return the item at the given index
+#     def __getitem__(self, idx) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#         # Tokenize the SMILES string and pad it to the block size
+#         smiles = "[CLS]" + self.smiles[idx].strip() + "[EOS]"
+#         smiles_tokens = self.smiles_regex.findall(smiles)
+#         smiles += "<pad>" * (self.block_size - len(smiles_tokens))
+
+#         # Retrieve the token indices
+#         true_token_idx = [self.stoi[s] for s in self.smiles_regex.findall(smiles)]
+
+#         # Mask the tokens
+#         mask_idx = []
+#         for s in range(len(smiles_tokens)):
+#             if random.random() < 0.15:
+#                 mask_idx.append(False)
+#                 num = random.random()
+#                 if num >= 0.2:
+#                     smiles_tokens[s] = "<MASK>"
+#                 elif num >= 0.1:
+#                     smiles_tokens[s] = self.vocab[
+#                         int(random.random() * len(self.vocab))
+#                     ]
+#             else:
+#                 mask_idx.append(True)
+
+#         # Identify the masked tokens
+#         mask_idx += [True] * (self.block_size - len(mask_idx))
+#         masked_smiles = "".join(smiles_tokens)
+
+#         # Pad to the block size
+#         masked_smiles += "<pad>" * (
+#             self.block_size - len(self.smiles_regex.findall(masked_smiles))
+#         )
+#         masked_token_idx = [
+#             self.stoi[s] for s in self.smiles_regex.findall(masked_smiles)
+#         ]
+
+#         return (
+#             torch.tensor(masked_token_idx, dtype=torch.long),
+#             torch.tensor(true_token_idx, dtype=torch.long),
+#             torch.tensor(mask_idx),
+#         )
 
 
 class TransformerModel(nn.Module):
@@ -377,16 +409,20 @@ class TransformerFeatureExtractor(torch.nn.Module):
     """
 
     def __init__(
-        self, model_parameters_file: Path, training_data_file: Path, device: str
+        self,
+        model_parameters_file: Path,
+        smiles_transformer_vocab: SMILESTransformerVocab,
+        device: str,
     ):
         super().__init__()
         self.device = device
 
-        # Load the dataset and model
-        self.dataset = TransformerDataset(data_file=training_data_file)
+        self.vocab = smiles_transformer_vocab
+
+        # Load the model
         self.model = TransformerModel(
-            vocab_size=len(self.dataset.vocab),
-            block_size=self.dataset.block_size,
+            vocab_size=len(self.vocab.vocab),
+            block_size=self.vocab.block_size,
             extract_features=True,
         ).to(self.device)
 
@@ -399,14 +435,11 @@ class TransformerFeatureExtractor(torch.nn.Module):
     def extract_features(self, smiles: str) -> torch.Tensor:
         # Tokenize the SMILES string and pad it to the block size
         smiles = "[CLS]" + smiles.strip() + "[EOS]"
-        smiles_tokens = self.dataset.smiles_regex.findall(smiles)
-        smiles += "<pad>" * (self.dataset.block_size - len(smiles_tokens))
+        smiles_tokens = self.vocab.smiles_regex.findall(smiles)
+        smiles += "<pad>" * (self.vocab.block_size - len(smiles_tokens))
         token_idx = (
             torch.tensor(
-                [
-                    self.dataset.stoi[s]
-                    for s in self.dataset.smiles_regex.findall(smiles)
-                ],
+                [self.vocab.stoi[s] for s in self.vocab.smiles_regex.findall(smiles)],
                 dtype=torch.long,
             )
             .unsqueeze(0)
@@ -2297,13 +2330,14 @@ def run(
         "SMILES_transformer_params.pt"
     ),
     smiles_transformer_training_data_file: Path = Path(
-        "SMILES_transformer_pretraining_data.csv"
+        "SMILES_transformer_pretraining_data.parquet"
     ),
     connected_graph_scaler_name: str = "connected_graph_scaler.pkl",
     unconnected_graph_scaler_name: str = "unconnected_graph_scaler.pkl",
     ligand_sequence_scaler_name: str = "ligand_sequence_scaler.pkl",
     protein_sequence_scaler_name: str = "protein_sequence_scaler.pkl",
     ligand_properties_scaler_name: str = "ligand_properties_scaler.pkl",
+    smiles_transformer_vocab_name: str = "smiles_transformer_vocab.json.zst",
     calc_surface_features: bool = True,
     device: str | None = None,
 ):
@@ -2347,10 +2381,14 @@ def run(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    smiles_transformer_vocab = create_or_load_smiles_transformer_vocab(
+        smiles_transformer_training_data_file, smiles_transformer_vocab_name
+    )
+
     logger.info("Loading transformer feature extractor")
     transformer_feature_extractor = TransformerFeatureExtractor(
         model_parameters_file=smiles_transformer_model_parameters_file,
-        training_data_file=smiles_transformer_training_data_file,
+        smiles_transformer_vocab=smiles_transformer_vocab,
         device=device,
     )
 
@@ -2434,7 +2472,7 @@ def run(
 
     # Scale the featurized connected graphs
     with importlib.resources.path(
-        DATA_SCALERS_BASE, connected_graph_scaler_name
+        RESOURCES_BASE, connected_graph_scaler_name
     ) as connected_graph_scaler_file:
         (
             scaled_ligand_features,
@@ -2455,7 +2493,7 @@ def run(
 
     # Scale the SMILES transformer encoder embedding
     with importlib.resources.path(
-        DATA_SCALERS_BASE, ligand_sequence_scaler_name
+        RESOURCES_BASE, ligand_sequence_scaler_name
     ) as ligand_sequence_scaler_file:
         scaled_transformer_embedding = _scale_transformer_embedding(
             transformer_embedding=transformer_vector,
@@ -2464,7 +2502,7 @@ def run(
 
     # Scale the RDKit 2D descriptor vector
     with importlib.resources.path(
-        DATA_SCALERS_BASE, ligand_properties_scaler_name
+        RESOURCES_BASE, ligand_properties_scaler_name
     ) as ligand_properties_scaler_file:
         scaled_rdkit_vector = _scale_rdkit_vector(
             rdkit_vector=rdkit_vector,
@@ -2473,7 +2511,7 @@ def run(
 
     # Scale the ESM2 embedding
     with importlib.resources.path(
-        DATA_SCALERS_BASE, protein_sequence_scaler_name
+        RESOURCES_BASE, protein_sequence_scaler_name
     ) as protein_sequence_scaler_file:
         scaled_esm2_embedding = _scale_esm2_embedding(
             esm2_embedding=esm2_embedding,
@@ -2482,7 +2520,7 @@ def run(
 
     # Scale the featurized unconnected graphs
     with importlib.resources.path(
-        DATA_SCALERS_BASE, unconnected_graph_scaler_name
+        RESOURCES_BASE, unconnected_graph_scaler_name
     ) as unconnected_graph_scaler_file:
         scaled_protein_features = _scale_unconnected_graph_features(
             protein_node_features=protein_features,
@@ -2528,3 +2566,31 @@ def run(
         logger.info(f"Prediction: {prediction}")
 
         logger.info("Successfully completed T-ALPHA inference.")
+
+
+def create_or_load_smiles_transformer_vocab(
+    smiles_transformer_training_data_file: Path,
+    smiles_transformer_vocab_name: str,
+) -> SMILESTransformerVocab:
+    with importlib.resources.path(
+        RESOURCES_BASE, smiles_transformer_vocab_name
+    ) as smiles_transformer_vocab_file:
+        if smiles_transformer_vocab_file.exists():
+            logger.info("Loading SMILES vocabulary")
+            with smart_open(smiles_transformer_vocab_file, "rt") as f:
+                smiles_transformer_vocab = SMILESTransformerVocab.model_validate_json(
+                    f.read()
+                )
+        else:
+            logger.info("Generating SMILES vocabulary")
+            with smart_open(smiles_transformer_vocab_file, "wt") as f:
+                smiles_list = pd.read_parquet(smiles_transformer_training_data_file)[
+                    "SMILES"
+                ].tolist()
+
+                smiles_transformer_vocab = SMILESTransformerVocab.from_smiles(
+                    smiles_list
+                )
+                f.write(smiles_transformer_vocab.model_dump_json())
+
+    return smiles_transformer_vocab

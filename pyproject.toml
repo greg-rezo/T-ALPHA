@@ -10,6 +10,7 @@ version = "0.1.0"
 dependencies = [
     "biopandas~=0.5",
     "biopython~=1.81",
+    "colorlog~=6.8",
     "h5py~=3.12",
     "matplotlib~=3.10",
     "networkx~=3.4",
@@ -17,18 +18,23 @@ dependencies = [
     "openbabel-wheel~=3.1",
     "pandas~=2.2",
     "pillow~=11.0",
+    "pyarrow~=18.1",
+    "pydantic~=2.7",
     "py3Dmol~=2.4",
     "pykeops~=2.2",
+    "python-json-logger~=2.0",
     "pytorch-lightning~=2.4",
     "PyYAML~=6.0",
     "rdkit~=2023.9.3",
     "requests~=2.32",
     "scikit-learn~=1.6",
+    "smart-open[gcs]~=7.1",
     "torch~=2.5",
     "torch-cluster~=1.6",
     "torch-geometric~=2.6",
     "torchmetrics~=1.6",
     "tqdm~=4.67",
+    "zstandard~=0.23",
 ]
 
 [project.entry-points."console_scripts"]
