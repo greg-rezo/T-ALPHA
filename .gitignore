@@ -1,7 +1,6 @@
 venv
 build
 __pycache__
-t_alpha.egg-info
 .vscode
 T-ALPHA_params.ckpt
 SMILES_transformer_params.pt

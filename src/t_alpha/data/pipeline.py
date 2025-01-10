@@ -1057,11 +1057,11 @@ class LigandFeatures(BaseModel):
 
     coords: np.ndarray
     features: np.ndarray
-    edges: np.ndarray
+    edge_ids: np.ndarray
     edge_attrs: np.ndarray
 
     complex_coords: np.ndarray
-    complex_features: np.ndarray
+    unscaled_complex_features: np.ndarray
 
 
 class LigandFeatureGenerator:
@@ -1296,32 +1296,32 @@ class LigandFeatureGenerator:
             transformer_vector=scaled_transformer_vector,
             features=scaled_ligand_node_features,
             coords=ligand_coords,
-            edges=ligand_edges,
+            edge_ids=ligand_edges,
             edge_attrs=scaled_ligand_edge_attrs,
             complex_coords=complex_coords,
-            complex_features=complex_features,
+            unscaled_complex_features=complex_features,
         )
 
 
 class ProteinFeatures(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    molecule: Molecule
+    full_molecule: Molecule
     pocket_molecule: Molecule
     sequence: str
     esm2_embedding: np.ndarray
 
     pocket_coords: np.ndarray
     pocket_features: np.ndarray
-    pocket_edges: np.ndarray
+    pocket_edge_ids: np.ndarray
     pocket_edge_attrs: np.ndarray
 
-    protein_coords: np.ndarray
-    protein_atom_types: np.ndarray
-    protein_features: np.ndarray
+    full_coords: np.ndarray
+    unscaled_full_atom_types: np.ndarray
+    full_features: np.ndarray
 
     complex_coords: np.ndarray
-    complex_features: np.ndarray
+    unscaled_complex_features: np.ndarray
 
 
 class ProteinSequenceScaler:
@@ -1640,71 +1640,73 @@ class ProteinFeatureGenerator:
         return pocket_molecule
 
     def from_molecule(
-        self, protein_molecule: Molecule, ligand_molecule: Molecule
+        self, full_protein_molecule: Molecule, ligand_molecule: Molecule
     ) -> ProteinFeatures:
-        sequence = self._protein_mol_to_seq(protein_molecule)
+        sequence = self._protein_mol_to_seq(full_protein_molecule)
         esm2_embedding = self._get_esm2_embedding(sequence, self.esm_model_name)
 
-        protein_pocket_molecule = self._extract_protein_pocket(
-            protein_molecule, ligand_molecule
+        pocket_protein_molecule = self._extract_protein_pocket(
+            full_protein_molecule, ligand_molecule
         )
 
-        conn_protein_node_features, conn_protein_coords = (
+        pocket_conn_node_features, pocket_conn_node_coords = (
             self.connected_featurizer.get_node_features(
-                protein_pocket_molecule, source="protein", complex_bool=False
+                pocket_protein_molecule, source="protein", complex_bool=False
             )
         )
-        conn_protein_edges, conn_protein_edge_attrs = map(
+        pocket_conn_edge_ids, pocket_conn_edge_attrs = map(
             np.array,
-            self.connected_featurizer.get_bond_based_edges(protein_pocket_molecule),
+            self.connected_featurizer.get_bond_based_edges(pocket_protein_molecule),
         )
-        conn_protein_node_features_complex, conn_protein_coords_complex = (
+        complex_pocket_conn_node_features, complex_pocket_conn_node_coords = (
             self.connected_featurizer.get_node_features(
-                protein_pocket_molecule, source="protein", complex_bool=True
+                pocket_protein_molecule, source="protein", complex_bool=True
             )
         )
 
-        unconn_full_protein_node_features, unconn_full_protein_coords = (
+        full_unconn_node_features, full_unconn_node_coords = (
             self.unconnected_featurizer.get_node_features(
-                protein_molecule, source="protein", complex_bool=False
+                full_protein_molecule, source="protein", complex_bool=False
             )
         )
-        unconn_full_protein_node_types = unconn_full_protein_node_features[:, :12]
-        unconn_full_protein_node_features = unconn_full_protein_node_features[:, 12:]
+        full_unconn_node_types = full_unconn_node_features[:, :12]  # not scaled
+        full_unconn_node_features_only = full_unconn_node_features[
+            :, 12:
+        ]  # will be scaled
 
         # Scale features
         scaled_esm2_embedding = self.protein_sequence_scaler.scale_esm2_embedding(
             esm2_embedding
         )
 
-        scaled_conn_protein_node_features = (
+        scaled_pocket_conn_node_features = (
             self.conn_graph_feature_scaler.scale_node_features(
-                conn_protein_node_features,
+                pocket_conn_node_features,
             )
         )
-        scaled_conn_protein_edge_attrs = (
-            self.conn_graph_feature_scaler.scale_edge_features(conn_protein_edge_attrs)
+        scaled_pocket_conn_edge_attrs = (
+            self.conn_graph_feature_scaler.scale_edge_features(pocket_conn_edge_attrs)
         )
-        scaled_unconn_protein_node_features = (
+        scaled_full_unconn_node_features_only = (
             self.unconn_graph_feature_scaler.scale_node_features(
-                unconn_full_protein_node_features,
+                full_unconn_node_features_only,
             )
         )
 
         return ProteinFeatures(
-            molecule=protein_molecule,
-            pocket_molecule=protein_pocket_molecule,
+            full_molecule=full_protein_molecule,
+            pocket_molecule=pocket_protein_molecule,
             sequence=sequence,
             esm2_embedding=scaled_esm2_embedding,
-            pocket_coords=conn_protein_coords,
-            pocket_features=scaled_conn_protein_node_features,
-            pocket_edges=conn_protein_edges,
-            pocket_edge_attrs=scaled_conn_protein_edge_attrs,
-            protein_coords=unconn_full_protein_coords,
-            protein_atom_types=unconn_full_protein_node_types,
-            protein_features=unconn_full_protein_node_features,
-            complex_coords=conn_protein_coords_complex,
-            complex_features=conn_protein_node_features_complex,
+            pocket_coords=pocket_conn_node_coords,
+            pocket_features=scaled_pocket_conn_node_features,
+            pocket_edge_ids=pocket_conn_edge_ids,
+            pocket_edge_attrs=scaled_pocket_conn_edge_attrs,
+            full_coords=full_unconn_node_coords,
+            unscaled_full_atom_types=full_unconn_node_types,
+            full_features=scaled_full_unconn_node_features_only,
+            complex_coords=complex_pocket_conn_node_coords,
+            unscaled_complex_features=complex_pocket_conn_node_features,
         )
 
 
@@ -1714,7 +1716,7 @@ class ComplexFeatures(BaseModel):
     ligand_features: LigandFeatures
     complex_coords: np.ndarray
     complex_features: np.ndarray
-    complex_edges: np.ndarray
+    complex_edge_ids: np.ndarray
     complex_edge_attrs: np.ndarray
 
 
@@ -1736,19 +1738,19 @@ class ComplexFeatureGenerator:
         self, ligand_features: LigandFeatures, protein_features: ProteinFeatures
     ) -> ComplexFeatures:
         ligand_node_features, ligand_coords = (
-            ligand_features.complex_features,
+            ligand_features.unscaled_complex_features,
             ligand_features.complex_coords,
         )
         protein_node_features, protein_coords = (
-            protein_features.complex_features,
+            protein_features.unscaled_complex_features,
             protein_features.complex_coords,
         )
 
-        complex_features = np.concatenate(
+        complex_node_features = np.concatenate(
             (protein_node_features, ligand_node_features), axis=0
         )
         complex_coords = np.concatenate((protein_coords, ligand_coords), axis=0)
-        complex_edges, complex_edge_attrs = (
+        complex_edge_ids, complex_edge_attrs = (
             self.connected_featurizer.get_protein_ligand_complex_edges(
                 protein_features.pocket_molecule, ligand_features.molecule
             )
@@ -1756,7 +1758,7 @@ class ComplexFeatureGenerator:
 
         scaled_complex_node_features = (
             self.conn_graph_feature_scaler.scale_node_features(
-                complex_features,
+                complex_node_features,
             )
         )
         scaled_complex_edge_attrs = self.conn_graph_feature_scaler.scale_edge_features(
@@ -1768,7 +1770,7 @@ class ComplexFeatureGenerator:
             ligand_features=ligand_features,
             complex_coords=complex_coords,
             complex_features=scaled_complex_node_features,
-            complex_edges=complex_edges,
+            complex_edge_ids=complex_edge_ids,
             complex_edge_attrs=scaled_complex_edge_attrs,
         )
 
@@ -2008,121 +2010,123 @@ class TAlphaDataset:
 
         data_list = []
         for ligand_molecule in ligand_molecules:
-            atom_coords_batch = torch.zeros(
-                protein_features.protein_coords.shape[0],  # Changed from size(0)
-                dtype=torch.long,
-                device=self.device,
-            )
-
-            ligand_features = self.ligand_feature_generator.from_molecule(
-                ligand_molecule
-            )
-            complex_features = (
-                self.complex_feature_generator.from_ligand_protein_features(
-                    ligand_features, protein_features
-                )
-            )
-
-            ligand_graph_data = Data(
-                node_feats=to_tensor(ligand_features.features),
-                node_coords=to_tensor(ligand_features.coords),
-                edge_index=to_tensor(ligand_features.edges, dtype=torch.long)
-                .t()
-                .contiguous(),
-                edge_attr=to_tensor(ligand_features.edge_attrs),
-            )
-            ligand_graph_batch = Batch.from_data_list([ligand_graph_data]).to(  # type: ignore
-                self.device
-            )
-            ligand_graph_batch_id = torch.zeros(
-                ligand_graph_data.node_feats.size(0),
-                dtype=torch.long,
-                device=self.device,
-            )
-
-            protein_graph_data = Data(
-                node_feats=to_tensor(protein_features.pocket_features),
-                node_coords=to_tensor(protein_features.pocket_coords),
-                edge_index=to_tensor(protein_features.pocket_edges, dtype=torch.long)
-                .t()
-                .contiguous(),
-                edge_attr=to_tensor(protein_features.pocket_edge_attrs),
-            )
-            protein_graph_batch = Batch.from_data_list([protein_graph_data]).to(  # type: ignore
-                self.device
-            )
-            protein_graph_batch_id = torch.zeros(
-                protein_graph_data.node_feats.size(0),
-                dtype=torch.long,
-                device=self.device,
-            )
-
-            complex_graph_data = Data(
-                node_feats=to_tensor(complex_features.complex_features),
-                node_coords=to_tensor(complex_features.complex_coords),
-                edge_index=to_tensor(complex_features.complex_edges, dtype=torch.long)
-                .t()
-                .contiguous(),
-                edge_attr=to_tensor(complex_features.complex_edge_attrs),
-            )
-            complex_graph_batch = Batch.from_data_list([complex_graph_data]).to(  # type: ignore
-                self.device
-            )
-            complex_graph_batch_id = torch.zeros(
-                complex_graph_data.node_feats.size(0),
-                dtype=torch.long,
-                device=self.device,
-            )
-
-            protein_atom_features = to_tensor(
-                np.concatenate(
-                    [
-                        protein_features.protein_atom_types,
-                        protein_features.protein_features,
-                    ],
-                    axis=1,
-                )
-            )
-
-            # TODO
-            protein_surface_features = (
-                self.protein_surface_feature_generator.from_tensors(
-                    atom_coords=to_tensor(protein_features.protein_coords),
-                    atom_coords_batch=atom_coords_batch,
-                    atom_types=to_tensor(protein_features.protein_atom_types),
-                    atom_features=protein_atom_features,
-                    ligand_coords=to_tensor(ligand_features.coords),
-                    ligand_coords_batch=ligand_graph_batch_id,
-                )
-            )
-
-            surface_batch_id = torch.zeros(
-                protein_surface_features.coords.size(0),
-                dtype=torch.long,
-                device=self.device,
-            )
-
-            data = {
-                "esm_vector": to_tensor(protein_features.esm2_embedding).unsqueeze(0),
-                "rdkit_vector": to_tensor(ligand_features.rdkit_vector).unsqueeze(0),
-                "roberta_vector": to_tensor(
-                    ligand_features.transformer_vector
-                ).unsqueeze(0),
-                "atom_coords_batch": atom_coords_batch,
-                "atom_coords": to_tensor(protein_features.protein_coords),
-                "atom_features": protein_atom_features,
-                "surface_coords": protein_surface_features.coords,
-                "surface_normals": protein_surface_features.normals,
-                "surface_batch_idx": surface_batch_id,
-                "protein_graph": protein_graph_batch,
-                "protein_graph_batch": protein_graph_batch_id,
-                "ligand_graph": ligand_graph_batch,
-                "ligand_graph_batch": ligand_graph_batch_id,
-                "complex_graph": complex_graph_batch,
-                "complex_graph_batch": complex_graph_batch_id,
-            }
+            data = self._collate_data_single_pair(protein_features, ligand_molecule)
             data_list.append(data)
         return data_list
+
+    def _collate_data_single_pair(
+        self, protein_features: ProteinFeatures, ligand_molecule: Molecule
+    ):
+        atom_coords_batch = torch.zeros(
+            protein_features.full_coords.shape[0],  # Changed from size(0)
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        ligand_features = self.ligand_feature_generator.from_molecule(ligand_molecule)
+        complex_features = self.complex_feature_generator.from_ligand_protein_features(
+            ligand_features, protein_features
+        )
+
+        ligand_graph_data = Data(
+            node_feats=to_tensor(ligand_features.features),
+            node_coords=to_tensor(ligand_features.coords),
+            edge_index=to_tensor(ligand_features.edge_ids, dtype=torch.long)
+            .t()
+            .contiguous(),
+            edge_attr=to_tensor(ligand_features.edge_attrs),
+        )
+        # TODO: fix batching
+        ligand_graph_batch = Batch.from_data_list([ligand_graph_data]).to(  # type: ignore
+            self.device
+        )
+        ligand_graph_batch_id = torch.zeros(
+            ligand_graph_data.node_feats.size(0),
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        protein_graph_data = Data(
+            node_feats=to_tensor(protein_features.pocket_features),
+            node_coords=to_tensor(protein_features.pocket_coords),
+            edge_index=to_tensor(protein_features.pocket_edge_ids, dtype=torch.long)
+            .t()
+            .contiguous(),
+            edge_attr=to_tensor(protein_features.pocket_edge_attrs),
+        )
+        protein_graph_batch = Batch.from_data_list([protein_graph_data]).to(  # type: ignore
+            self.device
+        )
+        protein_graph_batch_id = torch.zeros(
+            protein_graph_data.node_feats.size(0),
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        complex_graph_data = Data(
+            node_feats=to_tensor(complex_features.complex_features),
+            node_coords=to_tensor(complex_features.complex_coords),
+            edge_index=to_tensor(complex_features.complex_edge_ids, dtype=torch.long)
+            .t()
+            .contiguous(),
+            edge_attr=to_tensor(complex_features.complex_edge_attrs),
+        )
+        complex_graph_batch = Batch.from_data_list([complex_graph_data]).to(  # type: ignore
+            self.device
+        )
+        complex_graph_batch_id = torch.zeros(
+            complex_graph_data.node_feats.size(0),
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        full_protein_atom_features = to_tensor(
+            np.concatenate(
+                [
+                    protein_features.unscaled_full_atom_types,
+                    protein_features.full_features,
+                ],
+                axis=1,
+            )
+        )  # shape [N_atoms, D]
+
+        # TODO: move this outside of Dataset
+        protein_surface_features = self.protein_surface_feature_generator.from_tensors(
+            atom_coords=to_tensor(protein_features.full_coords),
+            atom_coords_batch=atom_coords_batch,
+            atom_types=to_tensor(protein_features.unscaled_full_atom_types),
+            atom_features=full_protein_atom_features,
+            ligand_coords=to_tensor(ligand_features.coords),
+            ligand_coords_batch=ligand_graph_batch_id,
+        )
+
+        surface_batch_id = torch.zeros(
+            protein_surface_features.coords.size(0),
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        data = {
+            "esm_vector": to_tensor(protein_features.esm2_embedding).unsqueeze(0),
+            "rdkit_vector": to_tensor(ligand_features.rdkit_vector).unsqueeze(0),
+            "roberta_vector": to_tensor(ligand_features.transformer_vector).unsqueeze(
+                0
+            ),
+            "atom_coords_batch": atom_coords_batch,
+            "atom_coords": to_tensor(protein_features.full_coords),
+            "atom_features": full_protein_atom_features,
+            "surface_coords": protein_surface_features.coords,
+            "surface_normals": protein_surface_features.normals,
+            "surface_batch_idx": surface_batch_id,
+            "protein_graph": protein_graph_batch,
+            "protein_graph_batch": protein_graph_batch_id,
+            "ligand_graph": ligand_graph_batch,
+            "ligand_graph_batch": ligand_graph_batch_id,
+            "complex_graph": complex_graph_batch,
+            "complex_graph_batch": complex_graph_batch_id,
+        }
+
+        return data
 
 
 def _pybel_mol_to_rdkit_mol(mol: Molecule) -> Mol:
