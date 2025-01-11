@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import ClassVar, cast
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -23,8 +24,11 @@ from openbabel.pybel import Molecule
 from pydantic import BaseModel, ConfigDict
 from pykeops.torch import LazyTensor
 from pykeops.torch.cluster import grid_cluster
-from rdkit.Chem import Descriptors, Mol
+from rdkit.Chem import AddHs, Descriptors, Mol, RemoveHs, SDWriter
+from rdkit.Chem.rdDistGeom import EmbedMolecule, ETKDGv3
+from rdkit.Chem.rdForceFieldHelpers import MMFFOptimizeMolecule
 from rdkit.Chem.rdmolfiles import (
+    MolFromSmiles,
     MolToSmiles,
     SDMolSupplier,
 )
@@ -40,6 +44,8 @@ from t_alpha.utils.checkpoint_utils import update_parameter_keys
 
 SRC_ROOT = Path(__file__).parent.parent
 RESOURCES_BASE = "t_alpha.resources"
+DEFAULT_SMILES_TRANSFORMER_MODEL_FILE = Path("SMILES_transformer_params.pt")
+DEFAULT_T_ALPHA_MODEL_FILE = Path("T-ALPHA_params.ckpt")
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +97,22 @@ class SMILESTransformerVocab(BaseModel):
             stoi=stoi,
             block_size=block_size + 2,
         )
+
+
+def embed_rdkit_mol(mol: Mol) -> Mol | None:
+    """Embed an RDKit molecule."""
+    if mol.GetNumConformers() == 0 or not mol.GetConformer().Is3D():
+        for i in range(mol.GetNumConformers()):
+            mol.RemoveConformer(i)
+        mol = RemoveHs(mol)
+        mol = AddHs(mol)
+        result = EmbedMolecule(mol, ETKDGv3())
+        if result == -1:
+            return None
+        else:
+            MMFFOptimizeMolecule(mol)
+
+        return mol
 
 
 class GraphFeaturizer:
@@ -1067,16 +1089,17 @@ class LigandFeatures(BaseModel):
 class LigandFeatureGenerator:
     ligand_sequence_scaler_name: ClassVar[str] = "ligand_sequence_scaler.pkl"
     ligand_properties_scaler_name: ClassVar[str] = "ligand_properties_scaler.pkl"
-    smiles_transformer_model_parameters_file: ClassVar[Path] = Path(
-        "SMILES_transformer_params.pt"
-    )
     smiles_transformer_training_data_file: ClassVar[Path] = Path(
         "SMILES_transformer_pretraining_data.parquet"
     )
     smiles_transformer_vocab_name: ClassVar[str] = "smiles_transformer_vocab.json.zst"
     connected_graph_scaler_name: ClassVar[str] = "connected_graph_scaler.pkl"
 
-    def __init__(self, device: str):
+    def __init__(
+        self,
+        device: str,
+        smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
+    ):
         smiles_transformer_vocab = create_or_load_smiles_transformer_vocab(
             self.smiles_transformer_training_data_file,
             self.smiles_transformer_vocab_name,
@@ -1085,7 +1108,7 @@ class LigandFeatureGenerator:
         self.smiles_transformer_vocab = smiles_transformer_vocab
         self.transformer_feature_extractor = TransformerFeatureExtractor(
             smiles_transformer_vocab=self.smiles_transformer_vocab,
-            model_parameters_file=self.smiles_transformer_model_parameters_file,
+            model_parameters_file=smiles_transformer_model_file,
             device=device,
         )
         self.connected_featurizer = GraphFeaturizer()
@@ -1245,7 +1268,7 @@ class LigandFeatureGenerator:
         return features
 
     def from_molecule(self, molecule: Molecule) -> "LigandFeatures":
-        rdkit_mol = _pybel_mol_to_rdkit_mol(molecule)
+        rdkit_mol = pybel_mol_to_rdkit_mol(molecule)
         rdkit_vector = self._get_rdkit_vector(rdkit_mol)
         transformer_vector = self._get_transformer_vector(
             rdkit_mol, self.transformer_feature_extractor
@@ -1993,37 +2016,56 @@ class ProteinSurfaceFeatureGenerator:
         return ProteinSurfaceFeatures(coords=P["xyz"], normals=P["normals"])
 
 
-class TAlphaDataset:
-    def __init__(self, esm_model_name: ESMModel, device: str):
+class TAlphaDatasetLoader:
+    def __init__(
+        self,
+        esm_model_name: ESMModel,
+        device: str,
+        smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
+    ):
         self.device = device
         self.protein_feature_generator = ProteinFeatureGenerator(esm_model_name, device)
-        self.ligand_feature_generator = LigandFeatureGenerator(device)
+        self.ligand_feature_generator = LigandFeatureGenerator(
+            device, smiles_transformer_model_file=smiles_transformer_model_file
+        )
         self.complex_feature_generator = ComplexFeatureGenerator(device)
         self.protein_surface_feature_generator = ProteinSurfaceFeatureGenerator(device)
 
     def from_molecules(
         self, protein_molecule: Molecule, ligand_molecules: list[Molecule]
     ) -> list[dict]:
+        logger.info("Generating protein features...")
         protein_features = self.protein_feature_generator.from_molecule(
             protein_molecule, ligand_molecules[0]
         )
 
         data_list = []
         for ligand_molecule in ligand_molecules:
+            logger.info(f"Generating ligand features for {ligand_molecule.title}")
             data = self._collate_data_single_pair(protein_features, ligand_molecule)
-            data_list.append(data)
+            if data is not None:
+                data_list.append(data)
         return data_list
 
     def _collate_data_single_pair(
         self, protein_features: ProteinFeatures, ligand_molecule: Molecule
-    ):
+    ) -> dict | None:
         atom_coords_batch = torch.zeros(
             protein_features.full_coords.shape[0],  # Changed from size(0)
             dtype=torch.long,
             device=self.device,
         )
 
-        ligand_features = self.ligand_feature_generator.from_molecule(ligand_molecule)
+        try:
+            ligand_features = self.ligand_feature_generator.from_molecule(
+                ligand_molecule
+            )
+        except ValueError as e:
+            logger.error(
+                f"Error generating ligand features for {ligand_molecule.title}: {e}"
+            )
+            return None
+
         complex_features = self.complex_feature_generator.from_ligand_protein_features(
             ligand_features, protein_features
         )
@@ -2129,22 +2171,37 @@ class TAlphaDataset:
         return data
 
 
-def _pybel_mol_to_rdkit_mol(mol: Molecule) -> Mol:
-    with tempfile.TemporaryDirectory() as temp_dir:
-        sdf_file = Path(temp_dir) / "mol.sdf"
-        mol.write("sdf", str(sdf_file))
+def pybel_mol_to_rdkit_mol(mol: Molecule) -> Mol:
+    with tempfile.NamedTemporaryFile(suffix=".sdf", delete=False) as temp_file:
+        # Write the molecule with explicit hydrogens and 3D coordinates
+        mol.write("sdf", temp_file.name, overwrite=True)
 
-        # Load the molecule into RDKit
-        suppl = SDMolSupplier(str(sdf_file), removeHs=False)
+        # Try to read with RDKit, being more permissive
+        suppl = SDMolSupplier(temp_file.name, removeHs=False, sanitize=False)
         mols = [m for m in suppl if m is not None]
-        if len(mols) == 0:
-            raise ValueError(f"No valid molecules found in {sdf_file}.")
-        elif len(mols) > 1:
-            raise ValueError(f"Multiple molecules found in {sdf_file}.")
-        else:
-            mol = mols[0]
 
-    return mol
+        if len(mols) == 0:
+            logger.info(f"No valid molecules found in {temp_file.name}, trying SMILES")
+            smiles = mol.write("smi").split()[0]  # type: ignore
+            rdkit_mol = MolFromSmiles(smiles)
+            if rdkit_mol is None:
+                raise ValueError(
+                    f"No valid molecules found in {temp_file.name} and SMILES conversion failed."
+                )
+            return rdkit_mol
+        elif len(mols) > 1:
+            raise ValueError(f"Multiple molecules found in {temp_file.name}.")
+        else:
+            rdkit_mol = mols[0]
+
+            return rdkit_mol
+
+
+def pybel_mol_from_rdkit_mol(rdkit_mol: Mol) -> Molecule:
+    with tempfile.NamedTemporaryFile(suffix=".sdf", delete=False) as temp_file:
+        with SDWriter(temp_file.name) as w:
+            w.write(rdkit_mol)
+        return next(pybel.readfile("sdf", temp_file.name))
 
 
 def soft_distances(x, y, batch_x, batch_y, smoothness=0.5, atomtypes=None):
@@ -2355,6 +2412,8 @@ def extract_single(P_batch, L_batch, number):
 def run_inference(
     ckpt_path: Path, data_list: list[dict], batch_size: int, device: str
 ) -> np.ndarray:
+    assert batch_size == 1, "Batch size must be 1 currently"
+
     # Update keys in parameter file
     with tempfile.TemporaryDirectory() as temp_dir:
         tmp_ckpt_path = Path(temp_dir) / "updated_T-ALPHA_params.ckpt"
@@ -2394,32 +2453,71 @@ def run_inference(
         return np.array(outputs)
 
 
-def run(
+def embed_pybel_mol(mol: Molecule) -> Molecule | None:
+    rdkit_mol = pybel_mol_to_rdkit_mol(mol)
+    rdkit_mol = embed_rdkit_mol(rdkit_mol)
+    if rdkit_mol is None:
+        logger.warning(f"Failed to embed molecule {mol.write('smi')}")
+        return None
+
+    return pybel_mol_from_rdkit_mol(rdkit_mol)
+
+
+def score_mol_files(
     protein_file: Path,
     ligand_file: Path,
-    batch_size: int,
     esm_model_name: ESMModel,
-    ckpt_path: Path = Path("T-ALPHA_params.ckpt"),
     device: str | None = None,
-):
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Add hydrogens to input files if provided
-    logger.info("Preparing protein and ligand files...")
-
+    batch_size: int = 1,
+    t_alpha_model_file: Path = DEFAULT_T_ALPHA_MODEL_FILE,
+    smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
+) -> npt.NDArray[np.float_]:
     # Add hydrogens to the protein
     protein_molecule = next(pybel.readfile("pdb", str(protein_file)))
     protein_molecule.OBMol.AddHydrogens()
 
     # Add hydrogens to the ligand
     ligand_format = ligand_file.suffix.lstrip(".")
-    ligand_molecules = list(pybel.readfile(ligand_format, str(ligand_file)))
-    for ligand_molecule in ligand_molecules:
-        ligand_molecule.OBMol.AddHydrogens()
+    ligand_mols = []
+    for ligand_molecule in list(pybel.readfile(ligand_format, str(ligand_file))):
+        embedded_ligand = embed_pybel_mol(ligand_molecule)
+        if embedded_ligand is None:
+            continue
+        ligand_mols.append(embedded_ligand)
 
-    data_list = TAlphaDataset(
-        esm_model_name=esm_model_name, device=device
+    logger.info(
+        f"Loaded protein with {len(protein_molecule.atoms)} atoms and "
+        f"{len(ligand_mols)} ligands"
+    )
+
+    return score_mols(
+        protein_molecule=protein_molecule,
+        ligand_molecules=ligand_mols,
+        esm_model_name=esm_model_name,
+        device=device,
+        batch_size=batch_size,
+        t_alpha_model_file=t_alpha_model_file,
+        smiles_transformer_model_file=smiles_transformer_model_file,
+    )
+
+
+def score_mols(
+    protein_molecule: Molecule,
+    ligand_molecules: list[Molecule],
+    esm_model_name: ESMModel,
+    device: str | None = None,
+    batch_size: int = 1,
+    t_alpha_model_file: Path = DEFAULT_T_ALPHA_MODEL_FILE,
+    smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
+) -> npt.NDArray[np.float_]:
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    logger.info("Generating T-ALPHA features...")
+    data_list = TAlphaDatasetLoader(
+        esm_model_name=esm_model_name,
+        device=device,
+        smiles_transformer_model_file=smiles_transformer_model_file,
     ).from_molecules(
         protein_molecule=protein_molecule,
         ligand_molecules=ligand_molecules,
@@ -2428,14 +2526,14 @@ def run(
     logger.info("Performing T-ALPHA inference...")
 
     pKds = run_inference(
-        ckpt_path=ckpt_path,
+        ckpt_path=t_alpha_model_file,
         data_list=data_list,
         batch_size=batch_size,
         device=device,
     )
     logger.info(f"Predictions: {pKds}")
 
-    logger.info("Successfully completed T-ALPHA inference.")
+    return pKds
 
 
 def create_or_load_smiles_transformer_vocab(
