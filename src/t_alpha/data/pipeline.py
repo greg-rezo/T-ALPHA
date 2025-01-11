@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import ClassVar, cast
 
 import numpy as np
-import numpy.typing as npt
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -1416,6 +1415,12 @@ class ProteinFeatureGenerator:
                 protein_sequence_scaler_file
             )
 
+        logger.info(f"Loading ESM2 model from huggingface: {esm_model_name}")
+        self.esm_model, self.esm_alphabet = torch.hub.load(
+            "facebookresearch/esm:main", esm_model_name.value
+        )
+        self.esm_batch_converter = self.esm_alphabet.get_batch_converter()
+
     @staticmethod
     def _protein_mol_to_seq(protein_molecule: Molecule) -> str:
         logger.info("Converting protein molecule to sequence")
@@ -1448,8 +1453,7 @@ class ProteinFeatureGenerator:
 
         return seq
 
-    @staticmethod
-    def _get_esm2_embedding(seq: str, esm_model_name: ESMModel) -> np.ndarray:
+    def _get_esm2_embedding(self, seq: str) -> np.ndarray:
         """
         Given a protein sequence across all protein chains, produce the ESM2 embedding for
         that combined sequence.
@@ -1469,23 +1473,18 @@ class ProteinFeatureGenerator:
         - numpy
         - The ESM2 model weights will be automatically downloaded by torch.hub if not cached.
         """
-
-        logger.info(f"Loading ESM2 model from huggingface: {esm_model_name}")
-        esm_model, esm_alphabet = torch.hub.load(
-            "facebookresearch/esm:main", esm_model_name.value
-        )
-
         # Convert the single protein sequence into tokens
         logger.info("Converting protein sequence into tokens")
-        esm_batch_converter = esm_alphabet.get_batch_converter()
-        _, _, batch_tokens = esm_batch_converter([("1", seq)])
-        batch_lens = (batch_tokens != esm_alphabet.padding_idx).sum(1)
+        _, _, batch_tokens = self.esm_batch_converter([("1", seq)])
+        batch_lens = (batch_tokens != self.esm_alphabet.padding_idx).sum(1)
 
         # Run the model to get embeddings from layer 33 as done previously
         logger.info("Running ESM2 model to get embeddings from layer 33")
-        esm_model.eval()
+        self.esm_model.eval()
         with torch.no_grad():
-            results = esm_model(batch_tokens, repr_layers=[33], return_contacts=False)
+            results = self.esm_model(
+                batch_tokens, repr_layers=[33], return_contacts=False
+            )
         token_representations = results["representations"][33]
 
         # Compute the average embedding over all residues
@@ -1666,7 +1665,7 @@ class ProteinFeatureGenerator:
         self, full_protein_molecule: Molecule, ligand_molecule: Molecule
     ) -> ProteinFeatures:
         sequence = self._protein_mol_to_seq(full_protein_molecule)
-        esm2_embedding = self._get_esm2_embedding(sequence, self.esm_model_name)
+        esm2_embedding = self._get_esm2_embedding(sequence)
 
         pocket_protein_molecule = self._extract_protein_pocket(
             full_protein_molecule, ligand_molecule
@@ -2031,7 +2030,7 @@ class TAlphaDatasetLoader:
         self.complex_feature_generator = ComplexFeatureGenerator(device)
         self.protein_surface_feature_generator = ProteinSurfaceFeatureGenerator(device)
 
-    def from_molecules(
+    def from_single_protein(
         self, protein_molecule: Molecule, ligand_molecules: list[Molecule]
     ) -> list[dict]:
         logger.info("Generating protein features...")
@@ -2043,8 +2042,24 @@ class TAlphaDatasetLoader:
         for ligand_molecule in ligand_molecules:
             logger.info(f"Generating ligand features for {ligand_molecule.title}")
             data = self._collate_data_single_pair(protein_features, ligand_molecule)
-            if data is not None:
-                data_list.append(data)
+            data_list.append(data)
+        return data_list
+
+    def from_multiple_proteins(
+        self, protein_molecules: list[Molecule], ligand_molecules: list[Molecule]
+    ) -> list[dict]:
+        data_list = []
+        for protein_molecule, ligand_molecule in zip(
+            protein_molecules, ligand_molecules
+        ):
+            logger.info(f"Generating protein features for {protein_molecule.title}")
+            protein_features = self.protein_feature_generator.from_molecule(
+                protein_molecule, ligand_molecule
+            )
+
+            logger.info(f"Generating ligand features for {ligand_molecule.title}")
+            data = self._collate_data_single_pair(protein_features, ligand_molecule)
+            data_list.append(data)
         return data_list
 
     def _collate_data_single_pair(
@@ -2409,15 +2424,23 @@ def extract_single(P_batch, L_batch, number):
     return P, L
 
 
-def run_inference(
-    ckpt_path: Path, data_list: list[dict], batch_size: int, device: str
+def get_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def score_data(
+    t_alpha_model_file: Path,
+    data_list: list[dict],
+    batch_size: int = 1,
+    device: str | None = None,
 ) -> np.ndarray:
     assert batch_size == 1, "Batch size must be 1 currently"
+    device = device or get_device()
 
     # Update keys in parameter file
     with tempfile.TemporaryDirectory() as temp_dir:
         tmp_ckpt_path = Path(temp_dir) / "updated_T-ALPHA_params.ckpt"
-        update_parameter_keys(ckpt_path, tmp_ckpt_path)
+        update_parameter_keys(t_alpha_model_file, tmp_ckpt_path)
 
         logger.info("Loading model from checkpoint")
         model = MetaModel(
@@ -2445,9 +2468,11 @@ def run_inference(
         with torch.no_grad():
             outputs = []
             for data in data_list:
-                output = lightning_model.model(data)
-                print(f"output: {output}")
-                outputs.append(output.cpu().numpy().flatten()[0])
+                if data is None:
+                    outputs.append(None)
+                else:
+                    output = lightning_model.model(data)
+                    outputs.append(output.cpu().numpy().flatten()[0])
 
         # output is the predicted binding affinity
         return np.array(outputs)
@@ -2463,77 +2488,70 @@ def embed_pybel_mol(mol: Molecule) -> Molecule | None:
     return pybel_mol_from_rdkit_mol(rdkit_mol)
 
 
-def score_mol_files(
-    protein_file: Path,
-    ligand_file: Path,
-    esm_model_name: ESMModel,
+# def score_compounds_single_protein_from_files(
+#     protein_file: Path,
+#     ligand_file: Path,
+#     esm_model_name: ESMModel,
+#     device: str | None = None,
+#     batch_size: int = 1,
+#     t_alpha_model_file: Path = DEFAULT_T_ALPHA_MODEL_FILE,
+#     smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
+# ) -> npt.NDArray[np.float_]:
+#     # Add hydrogens to the protein
+#     protein_molecule = next(pybel.readfile("pdb", str(protein_file)))
+#     protein_molecule.OBMol.AddHydrogens()
+
+#     # Add hydrogens to the ligand
+#     ligand_format = ligand_file.suffix.lstrip(".")
+#     ligand_mols = []
+#     for ligand_molecule in list(pybel.readfile(ligand_format, str(ligand_file))):
+#         embedded_ligand = embed_pybel_mol(ligand_molecule)
+#         if embedded_ligand is None:
+#             continue
+#         ligand_mols.append(embedded_ligand)
+
+#     logger.info(
+#         f"Loaded protein with {len(protein_molecule.atoms)} atoms and "
+#         f"{len(ligand_mols)} ligands"
+#     )
+
+#     return score_compounds_single_protein(
+#         protein_molecule=protein_molecule,
+#         ligand_molecules=ligand_mols,
+#         esm_model_name=esm_model_name,
+#         device=device,
+#         batch_size=batch_size,
+#         t_alpha_model_file=t_alpha_model_file,
+#         smiles_transformer_model_file=smiles_transformer_model_file,
+#     )
+
+
+def generate_features(
+    protein: Molecule | list[Molecule],
+    ligands: list[Molecule],
+    esm_model_name: ESMModel = ESMModel.ESM2_T36_3B_UR50D,
     device: str | None = None,
-    batch_size: int = 1,
-    t_alpha_model_file: Path = DEFAULT_T_ALPHA_MODEL_FILE,
     smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
-) -> npt.NDArray[np.float_]:
-    # Add hydrogens to the protein
-    protein_molecule = next(pybel.readfile("pdb", str(protein_file)))
-    protein_molecule.OBMol.AddHydrogens()
-
-    # Add hydrogens to the ligand
-    ligand_format = ligand_file.suffix.lstrip(".")
-    ligand_mols = []
-    for ligand_molecule in list(pybel.readfile(ligand_format, str(ligand_file))):
-        embedded_ligand = embed_pybel_mol(ligand_molecule)
-        if embedded_ligand is None:
-            continue
-        ligand_mols.append(embedded_ligand)
-
-    logger.info(
-        f"Loaded protein with {len(protein_molecule.atoms)} atoms and "
-        f"{len(ligand_mols)} ligands"
-    )
-
-    return score_mols(
-        protein_molecule=protein_molecule,
-        ligand_molecules=ligand_mols,
-        esm_model_name=esm_model_name,
-        device=device,
-        batch_size=batch_size,
-        t_alpha_model_file=t_alpha_model_file,
-        smiles_transformer_model_file=smiles_transformer_model_file,
-    )
-
-
-def score_mols(
-    protein_molecule: Molecule,
-    ligand_molecules: list[Molecule],
-    esm_model_name: ESMModel,
-    device: str | None = None,
-    batch_size: int = 1,
-    t_alpha_model_file: Path = DEFAULT_T_ALPHA_MODEL_FILE,
-    smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
-) -> npt.NDArray[np.float_]:
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
+) -> list[dict]:
     logger.info("Generating T-ALPHA features...")
-    data_list = TAlphaDatasetLoader(
+    device = device or get_device()
+
+    dataset_loader = TAlphaDatasetLoader(
         esm_model_name=esm_model_name,
         device=device,
         smiles_transformer_model_file=smiles_transformer_model_file,
-    ).from_molecules(
-        protein_molecule=protein_molecule,
-        ligand_molecules=ligand_molecules,
     )
 
-    logger.info("Performing T-ALPHA inference...")
-
-    pKds = run_inference(
-        ckpt_path=t_alpha_model_file,
-        data_list=data_list,
-        batch_size=batch_size,
-        device=device,
-    )
-    logger.info(f"Predictions: {pKds}")
-
-    return pKds
+    if isinstance(protein, Molecule):
+        return dataset_loader.from_single_protein(
+            protein_molecule=protein,
+            ligand_molecules=ligands,
+        )
+    else:
+        return dataset_loader.from_multiple_proteins(
+            protein_molecules=protein,
+            ligand_molecules=ligands,
+        )
 
 
 def create_or_load_smiles_transformer_vocab(

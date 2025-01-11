@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "t_alpha"
 requires-python = "~= 3.10.0"
-version = "0.1.0"
+version = "0.1.1"
 
 dependencies = [
     "biopandas~=0.5",
@@ -29,7 +29,7 @@ dependencies = [
     "requests~=2.32",
     "scikit-learn~=1.6",
     "smart-open[gcs]~=7.1",
-    "torch~=2.5",
+    "torch~=2.4",
     "torch-cluster~=1.6",
     "torch-geometric~=2.6",
     "torchmetrics~=1.6",
@@ -49,6 +49,5 @@ include = [
   "t_alpha.*"
 ]
 
-
 [tool.setuptools.package-data]
-"t_alpha.data_scalers" = ["*.pkl"]
+"t_alpha.resources" = ["*.pkl", "*.json.zst"]
