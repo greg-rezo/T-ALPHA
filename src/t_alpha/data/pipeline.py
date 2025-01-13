@@ -23,6 +23,7 @@ from openbabel.pybel import Molecule
 from pydantic import BaseModel, ConfigDict
 from pykeops.torch import LazyTensor
 from pykeops.torch.cluster import grid_cluster
+from rdkit import RDLogger
 from rdkit.Chem import AddHs, Descriptors, Mol, RemoveHs, SDWriter
 from rdkit.Chem.rdDistGeom import EmbedMolecule, ETKDGv3
 from rdkit.Chem.rdForceFieldHelpers import MMFFOptimizeMolecule
@@ -1141,12 +1142,12 @@ class LigandFeatureGenerator:
         all_descriptor_names = [d[0] for d in Descriptors.descList if d[0] != "SPS"]
 
         # Create a descriptor calculator for the selected descriptors
+        RDLogger.DisableLog("rdApp.warning")  # type: ignore
         calculator = MoleculeDescriptors.MolecularDescriptorCalculator(
             all_descriptor_names
         )
-
-        # Compute the descriptors
         descriptors = calculator.CalcDescriptors(rdkit_mol)
+        RDLogger.EnableLog("rdApp.warning")  # type: ignore
 
         # Convert to NumPy array
         rdkit_vector = np.array(descriptors, dtype=np.float32)
@@ -1510,12 +1511,24 @@ class ProteinFeatureGenerator:
             protein_molecule.write("pdb", str(protein_file))
             ligand_molecule.write("mol2", str(ligand_file))
 
+            num_prot_lines = protein_file.read_text().count("\n")
+            num_lig_lines = ligand_file.read_text().count("\n")
+            logger.info(
+                f"Parsing protein with num_lines={num_prot_lines} and"
+                f" ligand with num_lines={num_lig_lines}"
+            )
+
             # read in protein pdb file
             protein = PandasPdb().read_pdb(protein_file)
 
             # read in ligand mol2 file
             ligand = PandasMol2().read_mol2(ligand_file).df
             assert ligand is not None
+
+            logger.info(
+                f"Parsed protein with len={len(protein.df)} and"
+                f" ligand with len={len(ligand)}"
+            )
 
         # define protein atoms dataframe
         protein_atom = protein.df["ATOM"].reset_index(drop=True)
@@ -1655,6 +1668,10 @@ class ProteinFeatureGenerator:
         # define the atoms and heteroatoms of the object
         pred_pocket.df["ATOM"], pred_pocket.df["HETATM"] = residues, heteroatoms
         with tempfile.TemporaryDirectory() as temp_dir:
+            logger.info(
+                f"Writing pocket pdb file: num_atoms={len(residues)}"
+                f" num_hetatoms={len(heteroatoms)}"
+            )
             pocket_file = Path(temp_dir) / "protein_pocket.pdb"
             pred_pocket.to_pdb(str(pocket_file))
             pocket_molecule = next(pybel.readfile("pdb", str(pocket_file)))
@@ -2041,8 +2058,16 @@ class TAlphaDatasetLoader:
         data_list = []
         for ligand_molecule in ligand_molecules:
             logger.info(f"Generating ligand features for {ligand_molecule.title}")
-            data = self._collate_data_single_pair(protein_features, ligand_molecule)
-            data_list.append(data)
+            try:
+                data = self._collate_data_single_pair(protein_features, ligand_molecule)
+                data_list.append(data)
+            except Exception as e:
+                logger.error(
+                    f"Error generating ligand features for {ligand_molecule.title}: {e}"
+                )
+                continue
+
+        logger.info(f"Generated {len(data_list)} protein-ligand pairs")
         return data_list
 
     def from_multiple_proteins(
@@ -2052,14 +2077,22 @@ class TAlphaDatasetLoader:
         for protein_molecule, ligand_molecule in zip(
             protein_molecules, ligand_molecules
         ):
-            logger.info(f"Generating protein features for {protein_molecule.title}")
-            protein_features = self.protein_feature_generator.from_molecule(
-                protein_molecule, ligand_molecule
-            )
+            try:
+                logger.info(f"Generating protein features for {protein_molecule.title}")
+                protein_features = self.protein_feature_generator.from_molecule(
+                    protein_molecule, ligand_molecule
+                )
 
-            logger.info(f"Generating ligand features for {ligand_molecule.title}")
-            data = self._collate_data_single_pair(protein_features, ligand_molecule)
-            data_list.append(data)
+                logger.info(f"Generating ligand features for {ligand_molecule.title}")
+                data = self._collate_data_single_pair(protein_features, ligand_molecule)
+                data_list.append(data)
+            except Exception as e:
+                logger.error(
+                    f"Error generating ligand features for {ligand_molecule.title}: {e}"
+                )
+                continue
+
+        logger.info(f"Generated {len(data_list)} protein-ligand pairs")
         return data_list
 
     def _collate_data_single_pair(

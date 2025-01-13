@@ -27,7 +27,7 @@ dependencies = [
     "PyYAML~=6.0",
     "rdkit~=2023.9.3",
     "requests~=2.32",
-    "scikit-learn~=1.6",
+    "scikit-learn==1.4.0", # for compatibility with scaler pickle files
     "smart-open[gcs]~=7.1",
     "torch~=2.4",
     "torch-cluster~=1.6",
