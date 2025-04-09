@@ -1,7 +1,9 @@
 import argparse
 
-from src.inference.mc_dropout import perform_mc_dropout
-from src.utils.uncertainty_weighting import apply_uncertainty_weighting
+import torch
+
+from t_alpha.inference.mc_dropout import perform_mc_dropout
+from t_alpha.utils.uncertainty_weighting import apply_uncertainty_weighting
 
 
 def main(args):
@@ -57,7 +59,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda",
+        default=None,
         help="Device for inference (e.g., 'cuda' or 'cpu').",
     )
     parser.add_argument(
@@ -79,4 +81,5 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    args.device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     main(args)

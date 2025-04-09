@@ -1,14 +1,14 @@
 # The class in this file is adapted from the dMaSIF software corresponding
 # to this paper: <https://www.biorxiv.org/content/10.1101/2020.12.28.424589v1.full>
 
-import torch.nn as nn
 import torch
+import torch.nn as nn
 
-from src.utils.knn import knn_atoms
+from t_alpha.utils.knn import knn_atoms
 
 
 class AtomNet_MP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: dict):
         super(AtomNet_MP, self).__init__()
         self.args = config
         self.device = config["device"]
@@ -57,8 +57,14 @@ class AtomNet_MP(nn.Module):
 
         self.relu = nn.LeakyReLU(negative_slope=0.2)
 
-    def atom_atom_forward(self, x, y, atom_features, x_batch, y_batch):
-
+    def atom_atom_forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        atom_features: torch.Tensor,
+        x_batch: torch.Tensor,
+        y_batch: torch.Tensor,
+    ) -> torch.Tensor:
         # atomic coordinates
         # x: atom coordinates (reference points)
         # y: atom coordinates (query points)
@@ -112,8 +118,14 @@ class AtomNet_MP(nn.Module):
         # Shape is (num_atoms_in_batch, num_atomic_features)
         return out
 
-    def atom_embedding_forward(self, x, y, y_atomtypes, x_batch, y_batch):
-
+    def atom_embedding_forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        y_atomtypes: torch.Tensor,
+        x_batch: torch.Tensor,
+        y_batch: torch.Tensor,
+    ) -> torch.Tensor:
         # x: surface point coordinates (query points)
         # y: atom coordinates (reference points)
         x = x.to(self.device)
@@ -135,7 +147,6 @@ class AtomNet_MP(nn.Module):
 
         # Iterate over each layer for embedding calculations
         for i in range(self.n_layers):
-
             # Retrieve atom type features for closest atoms using the indices from knn
             features = y_atomtypes[idx.reshape(-1), :]
 
@@ -167,8 +178,14 @@ class AtomNet_MP(nn.Module):
         # shape is (num_points_in_batch, num_atom_types)
         return point_emb
 
-    def forward(self, xyz, atom_xyz, atom_features, batch, atom_batch):
-
+    def forward(
+        self,
+        xyz: torch.Tensor,
+        atom_xyz: torch.Tensor,
+        atom_features: torch.Tensor,
+        batch: torch.Tensor,
+        atom_batch: torch.Tensor,
+    ) -> torch.Tensor:
         # learn a representation for atoms
         # shape (all_atoms_in_batch, num_of_atomic_features)
         atomic_feature_embeddings = self.transform_atom_features(atom_features)

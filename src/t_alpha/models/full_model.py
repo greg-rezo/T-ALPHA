@@ -1,17 +1,17 @@
-from torch import nn
 import torch
-from torch_geometric.utils import to_dense_batch
-from torch_geometric.nn import global_mean_pool
-
-from src.models.surface_convnet import SurfaceConvNet
-from src.models.egnn_encoder import EGNN_Encoder
+from torch import nn
 from torch.nn import (
-    TransformerEncoderLayer,
+    TransformerDecoder,
     TransformerDecoderLayer,
     TransformerEncoder,
-    TransformerDecoder,
+    TransformerEncoderLayer,
 )
-from src.models.utils import AttentionPooling, masked_mean_pool
+from torch_geometric.nn import global_mean_pool
+from torch_geometric.utils import to_dense_batch
+
+from t_alpha.models.egnn_encoder import EGNNEncoder
+from t_alpha.models.surface_convnet import SurfaceConvNet
+from t_alpha.models.utils import AttentionPooling, masked_mean_pool
 
 
 class MetaModel(nn.Module):
@@ -39,28 +39,28 @@ class MetaModel(nn.Module):
 
     **Parameters:**
         Args:
-            device (str): Device to run the model on ('gpu' or 'cpu'). Default is 'gpu'.
-            batch_norm (bool): If True, applies Batch Normalization layers. Default is True.
-            use_protein_graph (bool): If True, includes the protein graph component. Default is True.
-            use_protein_surface (bool): If True, includes the protein surface component. Default is True.
-            use_protein_sequence (bool): If True, includes the protein sequence component. Default is True.
-            use_ligand_properties (bool): If True, includes the ligand properties component. Default is True.
-            use_ligand_graph (bool): If True, includes the ligand graph component. Default is True.
-            use_ligand_sequence (bool): If True, includes the ligand sequence component. Default is True.
-            use_complex_graph (bool): If True, includes the complex graph component. Default is True.
+            device: Device to run the model on ('gpu' or 'cpu'). Default is 'gpu'.
+            batch_norm: If True, applies Batch Normalization layers. Default is True.
+            use_protein_graph: If True, includes the protein graph component. Default is True.
+            use_protein_surface: If True, includes the protein surface component. Default is True.
+            use_protein_sequence: If True, includes the protein sequence component. Default is True.
+            use_ligand_properties: If True, includes the ligand properties component. Default is True.
+            use_ligand_graph: If True, includes the ligand graph component. Default is True.
+            use_ligand_sequence: If True, includes the ligand sequence component. Default is True.
+            use_complex_graph: If True, includes the complex graph component. Default is True.
     """
 
     def __init__(
         self,
-        device="gpu",
-        batch_norm=True,
-        use_protein_graph=True,
-        use_protein_surface=True,
-        use_protein_sequence=True,
-        use_ligand_properties=True,
-        use_ligand_graph=True,
-        use_ligand_sequence=True,
-        use_complex_graph=True,
+        device: str,
+        batch_norm: bool = True,
+        use_protein_graph: bool = True,
+        use_protein_surface: bool = True,
+        use_protein_sequence: bool = True,
+        use_ligand_properties: bool = True,
+        use_ligand_graph: bool = True,
+        use_ligand_sequence: bool = True,
+        use_complex_graph: bool = True,
     ):
         super(MetaModel, self).__init__()
         self.batch_norm = batch_norm
@@ -132,7 +132,9 @@ class MetaModel(nn.Module):
 
         if self.use_protein_graph:
             # protein graph model
-            self.protein_graph_model = EGNN_Encoder(in_node_nf=31, n_layers=4)
+            self.protein_graph_model = EGNNEncoder(
+                device=device, in_node_nf=31, n_layers=4
+            )
             # protein graph transformer output embedding layer
             self.protein_graph_transformer_output_embedding_layer = nn.Linear(1, 512)
 
@@ -218,7 +220,9 @@ class MetaModel(nn.Module):
 
         if self.use_ligand_graph:
             # ligand graph model
-            self.ligand_graph_model = EGNN_Encoder(in_node_nf=27, n_layers=4)
+            self.ligand_graph_model = EGNNEncoder(
+                device=device, in_node_nf=27, n_layers=4
+            )
             # ligand graph transformer output embedding layer
             self.ligand_graph_transformer_output_embedding_layer = nn.Linear(1, 512)
 
@@ -249,8 +253,8 @@ class MetaModel(nn.Module):
 
         if self.use_complex_graph:
             # complex graph model
-            self.complex_graph_model = EGNN_Encoder(
-                in_node_nf=33, n_layers=8, in_edge_nf=7
+            self.complex_graph_model = EGNNEncoder(
+                device=device, in_node_nf=33, n_layers=8, in_edge_nf=7
             )
 
             # complex graph embedding layer
@@ -335,7 +339,6 @@ class MetaModel(nn.Module):
             )
 
     def forward(self, data):
-
         # Move all tensor inputs to the device
         for key, value in data.items():
             if isinstance(value, torch.Tensor):
@@ -352,7 +355,6 @@ class MetaModel(nn.Module):
 
         # protein graph
         if self.use_protein_graph:
-
             # protein graph output
             protein_graph_output = self.protein_graph_model(
                 data["protein_graph"].node_feats,
@@ -476,7 +478,6 @@ class MetaModel(nn.Module):
                 ligand_properties_output
             )
 
-
         # ligand sequence
         if self.use_ligand_sequence:
             # ligand sequence output
@@ -502,10 +503,8 @@ class MetaModel(nn.Module):
                     ligand_sequence_output_embedding
                 )
 
-
         # ligand graph
         if self.use_ligand_graph:
-
             # ligand graph output
             ligand_graph_output = self.ligand_graph_model(
                 data["ligand_graph"].node_feats,
@@ -545,7 +544,6 @@ class MetaModel(nn.Module):
             pooled_ligand_graph_transformer_output = (
                 pooled_ligand_graph_transformer_output.permute(0, 2, 1)
             )
-
 
         # combine the three ligand transformer outputs
         if (

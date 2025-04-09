@@ -1,12 +1,17 @@
 # The functions in this file are adapted from the dMaSIF software corresponding
 # to this paper: <https://www.biorxiv.org/content/10.1101/2020.12.28.424589v1.full>
 
-from pykeops.torch import LazyTensor
 import torch
 import torch.nn.functional as F
+from pykeops.torch import LazyTensor
 
 
-def calculate_smoothed_normals(point_coords, scales=[1.0], batch=None, normals=None):
+def calculate_smoothed_normals(
+    point_coords: torch.Tensor,
+    scales: list[float],
+    batch: torch.Tensor,
+    normals: torch.Tensor,
+) -> torch.Tensor:
     """Returns a smooth field of normals, possibly at different scales.
 
     points, normals, scale(s)  ->      normals
@@ -30,7 +35,9 @@ def calculate_smoothed_normals(point_coords, scales=[1.0], batch=None, normals=N
 
     # different scales to pass the Gaussian window over
     # shape (S,)
-    scales = torch.Tensor(scales).type_as(point_coords)
+    scales_tensor = torch.tensor(scales, device=point_coords.device).type_as(
+        point_coords
+    )
 
     # Normal of a vertex = average of all normals in a ball of size "scale":
 
@@ -45,7 +52,7 @@ def calculate_smoothed_normals(point_coords, scales=[1.0], batch=None, normals=N
 
     # different scales to pass the Gaussian window over
     # shape (1, 1, S)
-    s = LazyTensor(scales[None, None, :])
+    s = LazyTensor(scales_tensor[None, None, :])
 
     # compute the squared Euclidean distance between each pair of points (vertices) and centers
     # shape (N, M, 1)
@@ -99,7 +106,13 @@ def tangent_vectors(normals):
     return uv
 
 
-def curvatures(points, scales=[1.0], batch=None, normals=None, reg=0.01):
+def curvatures(
+    points: torch.Tensor,
+    scales: list[float],
+    batch: torch.Tensor,
+    normals: torch.Tensor,
+    reg: float = 0.01,
+) -> torch.Tensor:
     """Returns a collection of mean (H) and Gauss (K) curvatures at different scales.
 
     points, faces, scales  ->  (H_1, K_1, ..., H_S, K_S)

@@ -1,14 +1,15 @@
 # The classes in this file are adapted from the dMaSIF software corresponding
 # to this paper: <https://www.biorxiv.org/content/10.1101/2020.12.28.424589v1.full>
 
-import torch.nn as nn
-import torch
-import numpy as np
 import math
-from pykeops.torch import LazyTensor
-import torch.nn.functional as F
 
-from src.utils.geometry import diagonal_ranges, tangent_vectors
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pykeops.torch import LazyTensor
+
+from t_alpha.utils.geometry import diagonal_ranges, tangent_vectors
 
 
 class dMaSIFConv(nn.Module):
@@ -91,18 +92,14 @@ class dMaSIFConv(nn.Module):
             nn.LeakyReLU(negative_slope=0.2),
             nn.Linear(self.Hidden, self.Hidden),  # (H, H) + (H,)
             nn.LeakyReLU(negative_slope=0.2),
-        ).to(
-            self.device
-        )  #  (H,)
+        ).to(self.device)  #  (H,)
         self.norm_in = nn.GroupNorm(4, self.Hidden).to(self.device)
 
         self.conv = nn.Sequential(
             nn.Linear(3, self.Cuts),  # (C, 3) + (C,)
             nn.ReLU(),  # KeOps does not support well LeakyReLu
             nn.Linear(self.Cuts, self.Hidden),
-        ).to(
-            self.device
-        )  # (H, C) + (H,)
+        ).to(self.device)  # (H, C) + (H,)
 
         # Transformation of the output features:
         self.net_out = nn.Sequential(
@@ -110,9 +107,7 @@ class dMaSIFConv(nn.Module):
             nn.LeakyReLU(negative_slope=0.2),
             nn.Linear(self.Output, self.Output),  # (O, O) + (O,)
             nn.LeakyReLU(negative_slope=0.2),
-        ).to(
-            self.device
-        )  #  (O,)
+        ).to(self.device)  #  (O,)
 
         self.norm_out = nn.GroupNorm(4, self.Output).to(self.device)
 
@@ -195,7 +190,6 @@ class dMaSIFConv(nn.Module):
 
         # n_heads is hidden_dim/head_dim
         for head in range(self.n_heads):
-
             # Extract a slice of width Hd from the feature array
             # head_features becomes shape (num_of_points_in_batch, hidden_dimension)
             head_start = head * self.heads_dim
@@ -304,7 +298,6 @@ class dMaSIFConv_seg(torch.nn.Module):
         ).to(self.device)
 
     def forward(self, features):
-
         # Load in xyz of points
         # Shape (total_num_points, 3)
         points = self.points
@@ -321,7 +314,6 @@ class dMaSIFConv_seg(torch.nn.Module):
         x = features
 
         for i, layer in enumerate(self.layers):
-
             # output shape is (points_in_batch, embedding_dim)
             x_i = layer(points, nuv, x, ranges)
 

@@ -3,12 +3,12 @@
 
 import torch.nn as nn
 
-from src.models.dmasif import dMaSIF
-from src.utils.run import iterate
+from t_alpha.models.dmasif import dMaSIF
+from t_alpha.utils.run import iterate
 
 
 class SurfaceConvNet(nn.Module):
-    def __init__(self, device, **kwargs):
+    def __init__(self, device: str, **kwargs):
         super(SurfaceConvNet, self).__init__()
 
         # Set default parameters

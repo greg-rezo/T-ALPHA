@@ -1,12 +1,12 @@
-import pytorch_lightning as pl
 import numpy as np
+import pytorch_lightning as pl
 import torch
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from torch_geometric.loader import DataListLoader
-from torch_geometric.data import Data, Batch
 from scipy.stats import pearsonr
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch_geometric.data import Batch, Data
+from torch_geometric.loader import DataListLoader
 
-from src.training.losses import custom_loss
+from t_alpha.training.losses import custom_loss
 
 
 class MetaModelLightning(pl.LightningModule):
@@ -37,7 +37,6 @@ class MetaModelLightning(pl.LightningModule):
         warmup_epochs=30,
         learning_rate=3e-4,
     ):
-
         super(MetaModelLightning, self).__init__()
         self.model = model
         self.batch_size = batch_size
@@ -64,7 +63,6 @@ class MetaModelLightning(pl.LightningModule):
         return self.model(data)
 
     def training_step(self, batch, batch_idx):
-
         loss, correlation, correlation_combined = self.process_batch(batch)
 
         # Log per-batch metrics
@@ -93,7 +91,6 @@ class MetaModelLightning(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-
         loss, correlation, correlation_combined = self.process_batch(batch)
 
         # Log per-batch metrics

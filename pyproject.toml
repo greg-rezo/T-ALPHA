@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t_alpha"
+requires-python = "~= 3.10.0"
+version = "0.1.1"
+
+dependencies = [
+    "biopandas~=0.5",
+    "biopython~=1.81",
+    "colorlog~=6.8",
+    "h5py~=3.12",
+    "matplotlib~=3.10",
+    "networkx~=3.4",
+    "numpy<2",
+    "openbabel-wheel~=3.1",
+    "pandas~=2.2",
+    "pillow~=11.0",
+    "pyarrow~=18.1",
+    "pydantic~=2.7",
+    "py3Dmol~=2.4",
+    "pykeops~=2.2",
+    "python-json-logger~=2.0",
+    "pytorch-lightning~=2.4",
+    "PyYAML~=6.0",
+    "rdkit~=2023.9.3",
+    "requests~=2.32",
+    "scikit-learn==1.4.0", # for compatibility with scaler pickle files
+    "smart-open[gcs]~=7.1",
+    "torch~=2.4",
+    "torch-cluster~=1.6",
+    "torch-geometric~=2.6",
+    "torchmetrics~=1.6",
+    "tqdm~=4.67",
+    "zstandard~=0.23",
+]
+
+[project.entry-points."console_scripts"]
+inference = "t_alpha.scripts.inference:main"
+gen_hdf5 = "t_alpha.scripts.gen_hdf5:main"
+mc_dropout = "t_alpha.scripts.mc_dropout:main"
+train = "t_alpha.scripts.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src/"]
+include = [
+  "t_alpha.*"
+]
+
+[tool.setuptools.package-data]
+"t_alpha.resources" = ["*.pkl", "*.json.zst"]
