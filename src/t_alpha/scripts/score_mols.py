@@ -10,6 +10,7 @@ from t_alpha.data.pipeline import (
     DEFAULT_T_ALPHA_MODEL_FILE,
     generate_features,
     score_data,
+    load_t_alpha_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,9 @@ def main(args):
         f"Loaded protein with {len(protein_molecule.atoms)} atoms and "
         f"{len(ligand_mols)} ligands"
     )
+
+    # load model and smiles data files to cache
+    load_t_alpha_files()
 
     data_list = generate_features(
         protein=protein_molecule,

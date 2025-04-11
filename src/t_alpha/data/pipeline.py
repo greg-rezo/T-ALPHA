@@ -37,6 +37,7 @@ from sklearn.discriminant_analysis import StandardScaler
 from smart_open import open as smart_open
 from torch.nn import functional as F
 from torch_geometric.data import Batch, Data
+import requests
 
 from t_alpha.models.full_model import MetaModel
 from t_alpha.training.lightning_module import MetaModelLightning
@@ -44,10 +45,30 @@ from t_alpha.utils.checkpoint_utils import update_parameter_keys
 
 SRC_ROOT = Path(__file__).parent.parent
 RESOURCES_BASE = "t_alpha.resources"
-DEFAULT_SMILES_TRANSFORMER_MODEL_FILE = Path("SMILES_transformer_params.pt")
-DEFAULT_T_ALPHA_MODEL_FILE = Path("T-ALPHA_params.ckpt")
+
+T_ALPHA_CACHE_DIR = Path.home() / ".cache" / "t_alpha"
+DEFAULT_SMILES_TRANSFORMER_MODEL_FILE = (
+    T_ALPHA_CACHE_DIR / "SMILES_transformer_params.pt"
+)
+DEFAULT_T_ALPHA_MODEL_FILE = T_ALPHA_CACHE_DIR / "T-ALPHA_params.ckpt"
 
 logger = logging.getLogger(__name__)
+
+
+def load_t_alpha_files():
+    T_ALPHA_CACHE_DIR.mkdir(exist_ok=True)
+
+    if not DEFAULT_T_ALPHA_MODEL_FILE.exists():
+        r = requests.get(
+            "https://zenodo.org/records/14514685/files/T-ALPHA_params.ckpt?download=1"
+        )
+        DEFAULT_T_ALPHA_MODEL_FILE.write_bytes(r.content)
+
+    if not DEFAULT_SMILES_TRANSFORMER_MODEL_FILE.exists():
+        r = requests.get(
+            "https://zenodo.org/records/14516013/files/Transformer_Encoder_for_SMILES.pt?download=1"
+        )
+        DEFAULT_SMILES_TRANSFORMER_MODEL_FILE.write_bytes(r.content)
 
 
 def to_tensor(
