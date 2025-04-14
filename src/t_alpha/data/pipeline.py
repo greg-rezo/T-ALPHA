@@ -30,6 +30,7 @@ from rdkit.Chem import (
     Mol,
     RemoveHs,
     SDWriter,
+    RemoveStereochemistry,
 )
 from rdkit.Chem.rdDistGeom import EmbedMolecule, ETKDGv3
 from rdkit.Chem.rdForceFieldHelpers import MMFFOptimizeMolecule
@@ -1282,6 +1283,12 @@ class LigandFeatureGenerator:
         """
         logger.info("Extracting transformer features from SMILES")
 
+        # Remove steriochemistry
+        # NOTE(Philipp): maybe spend at some point more time here, or re-visit
+        # when retraining this part of the model. Some components of SMILES
+        # strings did not make it into vocab. I was specifically running into
+        # some issues with the `/` and `\` stereochemistry symbols
+        RemoveStereochemistry(rdkit_mol)
         # Convert to canonical SMILES
         canonical_smiles = MolToSmiles(rdkit_mol, canonical=True)
 
