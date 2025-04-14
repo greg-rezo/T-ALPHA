@@ -24,7 +24,13 @@ from pydantic import BaseModel, ConfigDict
 from pykeops.torch import LazyTensor
 from pykeops.torch.cluster import grid_cluster
 from rdkit import RDLogger
-from rdkit.Chem import AddHs, Descriptors, Mol, RemoveHs, SDWriter
+from rdkit.Chem import (
+    AddHs,
+    Descriptors,
+    Mol,
+    RemoveHs,
+    SDWriter,
+)
 from rdkit.Chem.rdDistGeom import EmbedMolecule, ETKDGv3
 from rdkit.Chem.rdForceFieldHelpers import MMFFOptimizeMolecule
 from rdkit.Chem.rdmolfiles import (
@@ -702,11 +708,10 @@ class GraphFeaturizer:
         protein_edges, protein_edge_attrs = self.get_bond_based_edges(protein)
         ligand_edges, ligand_edge_attrs = self.get_bond_based_edges(ligand)
 
+        offset = np.asarray(protein_edges).max()
+
         # Offset ligand atom indices
-        ligand_edges_offset = [
-            (i + protein.OBMol.NumAtoms(), j + protein.OBMol.NumAtoms())
-            for i, j in ligand_edges
-        ]
+        ligand_edges_offset = [(i + offset, j + offset) for i, j in ligand_edges]
 
         # Assign binary interaction labels
         logger.info("Assigning binary interaction labels")
@@ -731,6 +736,7 @@ class GraphFeaturizer:
             protein_edge_attrs + ligand_edge_attrs + protein_ligand_attrs
         )
 
+        # breakpoint()
         return all_edges, all_edge_attrs
 
 
@@ -1824,6 +1830,7 @@ class ComplexFeatureGenerator:
         scaled_complex_edge_attrs = self.conn_graph_feature_scaler.scale_edge_features(
             complex_edge_attrs
         )
+        # breakpoint()
 
         return ComplexFeatures(
             protein_features=protein_features,
@@ -2083,7 +2090,7 @@ class TAlphaDatasetLoader:
                 data = self._collate_data_single_pair(protein_features, ligand_molecule)
                 data_list.append(data)
             except Exception as e:
-                logger.error(
+                logger.exception(
                     f"Error generating ligand features for {ligand_molecule.title}: {e}"
                 )
                 continue

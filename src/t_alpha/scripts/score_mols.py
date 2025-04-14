@@ -3,6 +3,7 @@ import logging
 import warnings
 from pathlib import Path
 
+import numpy as np
 from openbabel import pybel
 from rdkit import RDLogger
 
@@ -21,10 +22,11 @@ def parse_args():
     parser.add_argument("--protein_file", type=Path, required=True)
     parser.add_argument("--ligand_file", type=Path, required=True)
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--device", default=None)
     return parser.parse_args()
 
 
-def main(args):
+def main(args) -> np.ndarray:
     RDLogger.DisableLog("rdApp.*")  # Disable RDKit warnings # type: ignore
     warnings.filterwarnings("ignore")
 
@@ -55,9 +57,11 @@ def main(args):
     scores = score_data(
         data_list=data_list,
         t_alpha_model_file=DEFAULT_T_ALPHA_MODEL_FILE,
+        device=args.device,
     )
 
     logger.info(f"Scores: {scores}")
+    return scores
 
 
 if __name__ == "__main__":
