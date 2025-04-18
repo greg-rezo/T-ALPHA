@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 from openbabel import pybel
 from rdkit import RDLogger
+from rdkit import Chem
 
 from t_alpha.data.pipeline import (
     DEFAULT_T_ALPHA_MODEL_FILE,
@@ -26,6 +27,24 @@ def parse_args():
     return parser.parse_args()
 
 
+def load_ligand_rdkit_mol(sdf_file: Path) -> Chem.Mol:
+    suppl = Chem.SDMolSupplier(str(sdf_file), removeHs=False)
+    mols = [m for m in suppl if m is not None]
+    mol = mols[0]
+    if mol is None:
+        raise ValueError(f"No valid molecules found in {sdf_file}.")
+    return mol
+
+
+def load_ligand_openbabel_mol(sdf_file: Path) -> pybel.Molecule:
+    mol = next(pybel.readfile("sdf", str(sdf_file)))
+    if mol is None:
+        raise ValueError("Failed to load ligand with OpenBabel.")
+
+    mol.OBMol.AddHydrogens()
+    return mol
+
+
 def main(args) -> np.ndarray:
     RDLogger.DisableLog("rdApp.*")  # Disable RDKit warnings # type: ignore
     warnings.filterwarnings("ignore")
@@ -35,24 +54,33 @@ def main(args) -> np.ndarray:
 
     # Add hydrogens to the ligand
     ligand_format = args.ligand_file.suffix.lstrip(".")
-    ligand_mols = []
-    for ligand_mol in list(pybel.readfile(ligand_format, str(args.ligand_file))):
-        if ligand_mol is None:
-            continue
-        ligand_mols.append(ligand_mol)
+    assert ligand_format == "sdf", "Currently only support SDF as input files."
 
-    logger.info(
-        f"Loaded protein with {len(protein_molecule.atoms)} atoms and "
-        f"{len(ligand_mols)} ligands"
-    )
+    ligand_rdkit_mol = load_ligand_rdkit_mol(args.ligand_file)
+    ligand_openbabel_mol = load_ligand_openbabel_mol(args.ligand_file)
 
-    # load model and smiles data files to cache
+    logger.info(f"Loaded protein with {len(protein_molecule.atoms)} atoms.")
+
+    # load model and smiles data files to file cache
     load_t_alpha_files()
 
     data_list = generate_features(
         protein=protein_molecule,
-        ligands=ligand_mols,
+        openbabel_ligand=ligand_openbabel_mol,
+        rdkit_ligand=ligand_rdkit_mol,
     )
+    metadata = [
+        {
+            "protein_graph_edges": data["protein_graph"].edge_index.size(1),
+            "protein_graph_nodes": data["protein_graph"].node_coords.size(0),
+            "ligand_graph_edges": data["ligand_graph"].edge_index.size(1),
+            "ligand_graph_nodes": data["ligand_graph"].node_coords.size(0),
+            "complex_graph_edges": data["complex_graph"].edge_index.size(1),
+            "complex_graph_nodes": data["complex_graph"].node_coords.size(0),
+            "error": "",
+        }
+        for data in data_list
+    ]
 
     scores = score_data(
         data_list=data_list,
@@ -61,7 +89,7 @@ def main(args) -> np.ndarray:
     )
 
     logger.info(f"Scores: {scores}")
-    return scores
+    return scores, metadata
 
 
 if __name__ == "__main__":

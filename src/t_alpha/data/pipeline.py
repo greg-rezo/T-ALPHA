@@ -9,6 +9,7 @@ import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import ClassVar, Literal, cast
+import copy
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,7 @@ from pydantic import BaseModel, ConfigDict
 from pykeops.torch import LazyTensor
 from pykeops.torch.cluster import grid_cluster
 from rdkit import RDLogger
+from rdkit import Chem
 from rdkit.Chem import (
     AddHs,
     Descriptors,
@@ -725,7 +727,6 @@ class GraphFeaturizer:
 
         offset = protein.OBMol.NumAtoms()
         logger.debug(f"Found {offset} atoms in protein.")
-        # breakpoint()  # TODO remove
 
         # optional validation against node feature counts:
         if expected_protein_node_count:
@@ -755,7 +756,6 @@ class GraphFeaturizer:
         protein_ligand_edges, protein_ligand_attrs = self.get_distance_based_edges(
             protein, ligand, ligand_atom_idx_offset=offset
         )
-        # breakpoint()  TODO remove
         protein_ligand_attrs = [
             (attr + [1]) for attr in protein_ligand_attrs
         ]  # 1 for protein-ligand
@@ -1213,6 +1213,24 @@ class LigandFeatureGenerator:
                 f"Expected a vector of length 209, got {len(rdkit_vector)}."
             )
 
+        if np.isnan(rdkit_vector).any():
+            missing_descriptors = [
+                desc
+                for desc, is_missing in zip(
+                    all_descriptor_names, np.isnan(rdkit_vector)
+                )
+                if is_missing
+            ]
+            msg = (
+                f"Found {len(missing_descriptors)} missing values in RDKit "
+                f"feature vector: {missing_descriptors}",
+            )
+            logger.error(
+                msg,
+                extra={"missing_descriptors": missing_descriptors},
+            )
+            raise RuntimeError(msg)
+
         return rdkit_vector
 
     @staticmethod
@@ -1311,17 +1329,25 @@ class LigandFeatureGenerator:
         """
         logger.info("Extracting transformer features from SMILES")
 
-        # Remove steriochemistry
-        # NOTE(Philipp): maybe spend at some point more time here, or re-visit
-        # when retraining this part of the model. Some components of SMILES
-        # strings did not make it into vocab. I was specifically running into
-        # some issues with the `/` and `\` stereochemistry symbols
-        RemoveStereochemistry(rdkit_mol)
         # Convert to canonical SMILES
         canonical_smiles = MolToSmiles(rdkit_mol, canonical=True)
 
         # Extract features using the transformer model
-        features = transformer_feature_extractor.extract_features(canonical_smiles)
+        try:
+            features = transformer_feature_extractor.extract_features(canonical_smiles)
+        except KeyError as e:
+            logger.warning(
+                f"Failed looking up vocabulary: {e}, trying without stereochemistry."
+            )
+            # Remove steriochemistry
+            # NOTE(Philipp): maybe spend at some point more time here, or re-visit
+            # when retraining this part of the model. Some components of SMILES
+            # strings did not make it into vocab. I was specifically running into
+            # some issues with the `/` and `\` stereochemistry symbols
+            rdkit_mol = copy.deepcopy(rdkit_mol)
+            RemoveStereochemistry(rdkit_mol)
+            canonical_smiles = MolToSmiles(rdkit_mol, canonical=True)
+            features = transformer_feature_extractor.extract_features(canonical_smiles)
 
         # Ensure the result is a NumPy array
         if not isinstance(features, np.ndarray):
@@ -1329,8 +1355,10 @@ class LigandFeatureGenerator:
 
         return features
 
-    def from_molecule(self, molecule: Molecule) -> "LigandFeatures":
-        rdkit_mol = pybel_mol_to_rdkit_mol(molecule)
+    def from_molecule(
+        self, molecule: Molecule, rdkit_mol: Chem.Mol
+    ) -> "LigandFeatures":
+        molecule = safely_remove_hydrogens(molecule)
         rdkit_vector = self._get_rdkit_vector(rdkit_mol)
         transformer_vector = self._get_transformer_vector(
             rdkit_mol, self.transformer_feature_extractor
@@ -1887,9 +1915,7 @@ class ComplexFeatureGenerator:
 
         protein_molecule = safely_remove_hydrogens(protein_features.pocket_molecule)
         ligand_molecule = safely_remove_hydrogens(ligand_features.molecule)
-        assert (
-            protein_node_features.shape[0] == protein_molecule.OBMol.NumAtoms()
-        )  # TODO PHILIPP: this one currently failing
+        assert protein_node_features.shape[0] == protein_molecule.OBMol.NumAtoms()
         assert ligand_node_features.shape[0] == ligand_molecule.OBMol.NumAtoms()
 
         complex_node_features = np.concatenate(
@@ -2155,7 +2181,10 @@ class TAlphaDatasetLoader:
         self.protein_surface_feature_generator = ProteinSurfaceFeatureGenerator(device)
 
     def from_single_protein(
-        self, protein_molecule: Molecule, ligand_molecules: list[Molecule]
+        self,
+        protein_molecule: Molecule,
+        openbabel_ligand: Molecule,
+        rdkit_ligand: Chem.Mol,
     ) -> list[dict]:
         logger.info("Generating protein features...")
         # TODO(philipp): think about whether this could be an issue for
@@ -2164,20 +2193,14 @@ class TAlphaDatasetLoader:
         # based on the molecule and this could be different between different
         # ligands/poses
         protein_features = self.protein_feature_generator.from_molecule(
-            protein_molecule, ligand_molecules[0]
+            protein_molecule, openbabel_ligand
         )
 
         data_list = []
-        for ligand_molecule in ligand_molecules:
-            logger.info(f"Generating ligand features for {ligand_molecule.title}")
-            try:
-                data = self._collate_data_single_pair(protein_features, ligand_molecule)
-                data_list.append(data)
-            except Exception as e:
-                logger.exception(
-                    f"Error generating ligand features for {ligand_molecule.title}: {e}"
-                )
-                continue
+        data = self._collate_data_single_pair(
+            protein_features, openbabel_ligand, rdkit_ligand
+        )
+        data_list.append(data)
 
         logger.info(f"Generated {len(data_list)} protein-ligand pairs")
         return data_list
@@ -2208,7 +2231,10 @@ class TAlphaDatasetLoader:
         return data_list
 
     def _collate_data_single_pair(
-        self, protein_features: ProteinFeatures, ligand_molecule: Molecule
+        self,
+        protein_features: ProteinFeatures,
+        ligand_molecule: Molecule,
+        rdkit_ligand_molecule: Chem.Mol,
     ) -> dict | None:
         atom_coords_batch = torch.zeros(
             protein_features.full_coords.shape[0],  # Changed from size(0)
@@ -2216,15 +2242,9 @@ class TAlphaDatasetLoader:
             device=self.device,
         )
 
-        try:
-            ligand_features = self.ligand_feature_generator.from_molecule(
-                ligand_molecule
-            )
-        except ValueError as e:
-            logger.error(
-                f"Error generating ligand features for {ligand_molecule.title}: {e}"
-            )
-            return None
+        ligand_features = self.ligand_feature_generator.from_molecule(
+            ligand_molecule, rdkit_ligand_molecule
+        )
 
         complex_features = self.complex_feature_generator.from_ligand_protein_features(
             ligand_features, protein_features
@@ -2673,7 +2693,8 @@ def embed_pybel_mol(mol: Molecule) -> Molecule | None:
 
 def generate_features(
     protein: Molecule | list[Molecule],
-    ligands: list[Molecule],
+    openbabel_ligand: Molecule,
+    rdkit_ligand: Chem.Mol,
     esm_model_name: ESMModel = ESMModel.ESM2_T36_3B_UR50D,
     device: str | None = None,
     smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
@@ -2690,9 +2711,11 @@ def generate_features(
     if isinstance(protein, Molecule):
         return dataset_loader.from_single_protein(
             protein_molecule=protein,
-            ligand_molecules=ligands,
+            openbabel_ligand=openbabel_ligand,
+            rdkit_ligand=rdkit_ligand,
         )
     else:
+        raise RuntimeError("Blocking of code path for now.")
         return dataset_loader.from_multiple_proteins(
             protein_molecules=protein,
             ligand_molecules=ligands,
@@ -2750,9 +2773,3 @@ def safely_remove_hydrogens(mol: Molecule) -> Molecule:
 
     logger.debug(f"Removed {n_atoms_before - n_atoms_after} hydrogens from molecule.")
     return mol
-
-
-def test_hydrogen_removal():
-    mol = next(pybel.readfile("pdb", "test_unreliable_hydrogens.pdb"))
-    mol.OBMol.DeleteHydrogens()
-    assert sum(a.atomicnum == 1 for a in mol) == 0
