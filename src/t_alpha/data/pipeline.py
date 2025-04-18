@@ -8,7 +8,7 @@ import re
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import ClassVar, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -395,7 +395,7 @@ class GraphFeaturizer:
     def get_node_features(
         self,
         molecule: Molecule,
-        source: str = "ligand",
+        source: Literal["ligand", "protein"] = "ligand",
         complex_bool: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         logger.info(f"Generating node features for molecule {source=} {complex_bool=}")
@@ -551,7 +551,7 @@ class GraphFeaturizer:
         )
 
         # Remove hydrogens from the molecule
-        molecule.OBMol.DeleteHydrogens()
+        molecule = safely_remove_hydrogens(molecule)
 
         edge_idx, edge_attr = [], []
         for bond in openbabel.OBMolBondIter(molecule.OBMol):
@@ -631,18 +631,23 @@ class GraphFeaturizer:
         return edge_idx, edge_attr
 
     def get_distance_based_edges(
-        self, protein, ligand, distance_threshold=4.5
+        self,
+        protein,
+        ligand,
+        ligand_atom_idx_offset: int,
+        distance_threshold: float = 4.5,
     ) -> tuple[
         list, list
     ]:  # 4.5 A corresponds to hydrophobic threshold deined by ProLIF
         # remove hydrogens from the protein and ligand
-        protein.OBMol.DeleteHydrogens()
-        ligand.OBMol.DeleteHydrogens()
+        protein = safely_remove_hydrogens(protein)
+        ligand = safely_remove_hydrogens(ligand)
 
         # Get the coordinates and electronegativity of the protein atoms
         logger.info("Getting protein coordinates and electronegativity")
         protein_coords, protein_electronegativities, protein_charges = [], [], []
-        for atom in openbabel.OBMolAtomIter(protein.OBMol):
+        for i, atom in enumerate(openbabel.OBMolAtomIter(protein.OBMol)):
+            assert i == atom.GetIdx() - 1
             if atom.GetAtomicNum() == 1:
                 continue  # Skip hydrogen atoms
 
@@ -655,7 +660,8 @@ class GraphFeaturizer:
         # Get the coordinates and electronegativity of the ligand atoms
         logger.info("Getting ligand coordinates and electronegativity")
         ligand_coords, ligand_electronegativities, ligand_charges = [], [], []
-        for atom in openbabel.OBMolAtomIter(ligand.OBMol):
+        for i, atom in enumerate(openbabel.OBMolAtomIter(ligand.OBMol)):
+            assert i == atom.GetIdx() - 1
             if atom.GetAtomicNum() == 1:
                 continue  # Skip hydrogen atoms
 
@@ -679,7 +685,8 @@ class GraphFeaturizer:
         logger.info("Generating distance-based edges")
         edge_idx, edge_attr = [], []
         for i, j in zip(protein_indices, ligand_indices):
-            ligand_index = j + len(protein_coords)
+            assert i < ligand_atom_idx_offset
+            ligand_index = j + ligand_atom_idx_offset
 
             distance = distances[i, j]
             electronegativity_difference = np.abs(
@@ -703,16 +710,37 @@ class GraphFeaturizer:
         return edge_idx, edge_attr
 
     def get_protein_ligand_complex_edges(
-        self, protein: Molecule, ligand: Molecule
+        self,
+        protein: Molecule,
+        ligand: Molecule,
+        expected_protein_node_count: int | None = None,  # TODO remove
+        expected_ligand_node_count: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
+        # preprocess protein and ligand
+        protein = protein.clone
+        ligand = ligand.clone
+
+        protein = safely_remove_hydrogens(protein)
+        ligand = safely_remove_hydrogens(ligand)
+
+        offset = protein.OBMol.NumAtoms()
+        logger.debug(f"Found {offset} atoms in protein.")
+        # breakpoint()  # TODO remove
+
+        # optional validation against node feature counts:
+        if expected_protein_node_count:
+            assert protein.OBMol.NumAtoms() == expected_protein_node_count
+
+        if expected_ligand_node_count:
+            assert ligand.OBMol.NumAtoms() == expected_ligand_node_count
+
         # Get bond-based edges for protein and ligand
         protein_edges, protein_edge_attrs = self.get_bond_based_edges(protein)
         ligand_edges, ligand_edge_attrs = self.get_bond_based_edges(ligand)
 
-        offset = np.asarray(protein_edges).max()
-
         # Offset ligand atom indices
-        ligand_edges_offset = [(i + offset, j + offset) for i, j in ligand_edges]
+        ligand_edges = [(i + offset, j + offset) for i, j in ligand_edges]
+        assert np.asarray(protein_edges).max() < offset
 
         # Assign binary interaction labels
         logger.info("Assigning binary interaction labels")
@@ -725,19 +753,19 @@ class GraphFeaturizer:
 
         # Get distance-based edges between protein and ligand
         protein_ligand_edges, protein_ligand_attrs = self.get_distance_based_edges(
-            protein, ligand
+            protein, ligand, ligand_atom_idx_offset=offset
         )
+        # breakpoint()  TODO remove
         protein_ligand_attrs = [
             (attr + [1]) for attr in protein_ligand_attrs
         ]  # 1 for protein-ligand
 
         # Combine all edges
-        all_edges = np.array(protein_edges + ligand_edges_offset + protein_ligand_edges)
+        all_edges = np.array(protein_edges + ligand_edges + protein_ligand_edges)
         all_edge_attrs = np.array(
             protein_edge_attrs + ligand_edge_attrs + protein_ligand_attrs
         )
 
-        # breakpoint()
         return all_edges, all_edge_attrs
 
 
@@ -1536,6 +1564,11 @@ class ProteinFeatureGenerator:
         ligand_molecule: Molecule,
         neighbor_radius: float = 8,
     ) -> Molecule:
+        """Extract protein pocket from protein-ligand pair.
+
+        The extracted pocket still has hydrogen atoms attached (necessary for
+        surface calculations.)
+        """
         logger.info("Identifying protein pocket")
 
         # Load the protein and ligand molecules into biopandas objects
@@ -1719,22 +1752,53 @@ class ProteinFeatureGenerator:
         esm2_embedding = self._get_esm2_embedding(sequence)
 
         pocket_protein_molecule = self._extract_protein_pocket(
-            full_protein_molecule, ligand_molecule
+            full_protein_molecule.clone, ligand_molecule.clone
         )
 
         pocket_conn_node_features, pocket_conn_node_coords = (
             self.connected_featurizer.get_node_features(
-                pocket_protein_molecule, source="protein", complex_bool=False
+                pocket_protein_molecule.clone, source="protein", complex_bool=False
             )
         )
         pocket_conn_edge_ids, pocket_conn_edge_attrs = map(
             np.array,
-            self.connected_featurizer.get_bond_based_edges(pocket_protein_molecule),
+            self.connected_featurizer.get_bond_based_edges(
+                pocket_protein_molecule.clone
+            ),
         )
         complex_pocket_conn_node_features, complex_pocket_conn_node_coords = (
             self.connected_featurizer.get_node_features(
-                pocket_protein_molecule, source="protein", complex_bool=True
+                pocket_protein_molecule.clone, source="protein", complex_bool=True
             )
+        )
+
+        # assert that feature and coord vectors have the expected length
+        pocket_protein_molecule_wo_hydrogen = safely_remove_hydrogens(
+            pocket_protein_molecule
+        )
+        expected_pocket_protein_atoms = (
+            pocket_protein_molecule_wo_hydrogen.OBMol.NumAtoms()
+        )
+        expected_pocket_coords = np.asarray(
+            [a.coords for a in pocket_protein_molecule_wo_hydrogen]
+        )
+        assert (
+            expected_pocket_protein_atoms
+            == pocket_conn_node_features.shape[0]
+            == pocket_conn_node_coords.shape[0]
+        )
+        assert (
+            expected_pocket_protein_atoms
+            == complex_pocket_conn_node_features.shape[0]
+            == complex_pocket_conn_node_coords.shape[0]
+        )
+        assert np.allclose(
+            expected_pocket_coords,
+            pocket_conn_node_coords,
+        )
+        assert np.allclose(
+            expected_pocket_coords,
+            complex_pocket_conn_node_coords,
         )
 
         full_unconn_node_features, full_unconn_node_coords = (
@@ -1818,6 +1882,15 @@ class ComplexFeatureGenerator:
             protein_features.unscaled_complex_features,
             protein_features.complex_coords,
         )
+        assert ligand_node_features.shape[0] == ligand_coords.shape[0]
+        assert protein_node_features.shape[0] == protein_coords.shape[0]
+
+        protein_molecule = safely_remove_hydrogens(protein_features.pocket_molecule)
+        ligand_molecule = safely_remove_hydrogens(ligand_features.molecule)
+        assert (
+            protein_node_features.shape[0] == protein_molecule.OBMol.NumAtoms()
+        )  # TODO PHILIPP: this one currently failing
+        assert ligand_node_features.shape[0] == ligand_molecule.OBMol.NumAtoms()
 
         complex_node_features = np.concatenate(
             (protein_node_features, ligand_node_features), axis=0
@@ -1825,7 +1898,7 @@ class ComplexFeatureGenerator:
         complex_coords = np.concatenate((protein_coords, ligand_coords), axis=0)
         complex_edge_ids, complex_edge_attrs = (
             self.connected_featurizer.get_protein_ligand_complex_edges(
-                protein_features.pocket_molecule, ligand_features.molecule
+                protein_molecule, ligand_molecule
             )
         )
 
@@ -1837,7 +1910,6 @@ class ComplexFeatureGenerator:
         scaled_complex_edge_attrs = self.conn_graph_feature_scaler.scale_edge_features(
             complex_edge_attrs
         )
-        # breakpoint()
 
         return ComplexFeatures(
             protein_features=protein_features,
@@ -2086,6 +2158,11 @@ class TAlphaDatasetLoader:
         self, protein_molecule: Molecule, ligand_molecules: list[Molecule]
     ) -> list[dict]:
         logger.info("Generating protein features...")
+        # TODO(philipp): think about whether this could be an issue for
+        # evaluating multiple poses/different ligands against a single target.
+        # I currently think it is an issue, because we are extracting the pocket
+        # based on the molecule and this could be different between different
+        # ligands/poses
         protein_features = self.protein_feature_generator.from_molecule(
             protein_molecule, ligand_molecules[0]
         )
@@ -2648,3 +2725,34 @@ def create_or_load_smiles_transformer_vocab(
                 f.write(smiles_transformer_vocab.model_dump_json())
 
     return smiles_transformer_vocab
+
+
+def safely_remove_hydrogens(mol: Molecule) -> Molecule:
+    mol = mol.clone
+    n_atoms_before = mol.OBMol.NumAtoms()
+
+    mol.OBMol.DeleteHydrogens()
+
+    h_atoms_remaining = [atom for atom in mol if atom.atomicnum == 1]
+    if h_atoms_remaining:
+        logger.warning(
+            f"Found {len(h_atoms_remaining)} hydrogen atoms after calling "
+            f"`DeleteHydrogens`, trying manual deletion..."
+        )
+
+        for h_atom in h_atoms_remaining:
+            mol.OBMol.DeleteAtom(h_atom.OBAtom)
+
+    if sum(atom.atomicnum == 1 for atom in mol):
+        raise ValueError("Manual deletion of hydrogen atoms was unsuccessful.")
+
+    n_atoms_after = mol.OBMol.NumAtoms()
+
+    logger.debug(f"Removed {n_atoms_before - n_atoms_after} hydrogens from molecule.")
+    return mol
+
+
+def test_hydrogen_removal():
+    mol = next(pybel.readfile("pdb", "test_unreliable_hydrogens.pdb"))
+    mol.OBMol.DeleteHydrogens()
+    assert sum(a.atomicnum == 1 for a in mol) == 0
