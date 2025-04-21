@@ -75,7 +75,7 @@ dependencies = [
     "pydantic~=2.7",
     "py3Dmol~=2.4",
     "python-json-logger~=2.0",
-    "rdkit~=2023.9.3,<2024.09.4",
+    "rdkit==2024.9.3",  # TODO make sure this does not cause issues
     # "scikit-learn==1.4.0", # for compatibility with scaler pickle files
     "smart-open[gcs]~=7.1",
     "torch-cluster~=1.6",
