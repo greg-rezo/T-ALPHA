@@ -1,7 +1,7 @@
 import argparse
 
-from src.inference.perform_inference import perform_inference
-from src.utils.checkpoint_utils import update_parameter_keys
+from t_alpha.inference.perform_inference import perform_inference
+from t_alpha.utils.checkpoint_utils import update_parameter_keys
 
 
 def main():
