@@ -22,6 +22,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--protein_file", type=Path, required=True)
     parser.add_argument("--ligand_file", type=Path, required=True)
+    parser.add_argument("--protein_sequence", default=None)
+    parser.add_argument("--smiles", default=None)
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--device", default=None)
     return parser.parse_args()
@@ -68,8 +70,8 @@ def main(args) -> np.ndarray:
         protein=protein_molecule,
         openbabel_ligand=ligand_openbabel_mol,
         rdkit_ligand=ligand_rdkit_mol,
-        protein_sequence=None,
-        smiles=None,
+        protein_sequence=args.protein_sequence,
+        smiles=args.smiles,
     )
     metadata = [
         {
