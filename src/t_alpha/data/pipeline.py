@@ -4,11 +4,12 @@ import importlib.resources
 import logging
 import math
 import pickle
+import functools
 import re
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import ClassVar, Literal, cast
+from typing import ClassVar, Literal, cast, Any
 import copy
 
 import numpy as np
@@ -1479,7 +1480,7 @@ class ProteinFeatureGenerator:
     unconnected_graph_scaler_name: ClassVar[str] = "unconnected_graph_scaler.pkl"
     protein_sequence_scaler_name: ClassVar[str] = "protein_sequence_scaler.pkl"
 
-    def __init__(self, esm_model_name: ESMModel, device: str):
+    def __init__(self, esm_model_name: ESMModel, device: str, use_cache: bool = True):
         self.esm_model_name = esm_model_name
         self.device = device
         self.connected_featurizer = GraphFeaturizer(surface_features_bool=False)
@@ -1507,10 +1508,14 @@ class ProteinFeatureGenerator:
             )
 
         logger.info(f"Loading ESM2 model from huggingface: {esm_model_name}")
-        self.esm_model, self.esm_alphabet = torch.hub.load(
-            "facebookresearch/esm:main", esm_model_name.value
-        )
-        self.esm_batch_converter = self.esm_alphabet.get_batch_converter()
+        if use_cache:
+            self.esm_model, self.esm_alphabet, self.esm_batch_converter = (
+                load_esm_model_with_cache(self.esm_model_name.value)
+            )
+        else:
+            self.esm_model, self.esm_alphabet, self.esm_batch_converter = (
+                load_esm_model(self.esm_model_name.value)
+            )
 
     @staticmethod
     def _protein_mol_to_seq(protein_molecule: Molecule) -> str:
@@ -2773,3 +2778,19 @@ def safely_remove_hydrogens(mol: Molecule) -> Molecule:
 
     logger.debug(f"Removed {n_atoms_before - n_atoms_after} hydrogens from molecule.")
     return mol
+
+
+def load_esm_model(esm_model_name: str) -> tuple[Any, Any, Any]:
+    """Load the ESM model and alphabet."""
+    esm_model, esm_alphabet = torch.hub.load(
+        "facebookresearch/esm:main", esm_model_name
+    )
+    esm_batch_converter = esm_alphabet.get_batch_converter()
+
+    return esm_model, esm_alphabet, esm_batch_converter
+
+
+@functools.cache
+def load_esm_model_with_cache(esm_model_name: str) -> tuple[Any, Any, Any]:
+    """Load the ESM model and alphabet with in-memory cache."""
+    return load_esm_model(esm_model_name)
