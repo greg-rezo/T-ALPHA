@@ -1309,7 +1309,10 @@ class LigandFeatureGenerator:
 
     @staticmethod
     def _get_transformer_vector(
-        rdkit_mol: Mol, transformer_feature_extractor: TransformerFeatureExtractor
+        *,
+        transformer_feature_extractor: TransformerFeatureExtractor,
+        smiles: str | None = None,
+        rdkit_mol: Mol | None = None,
     ) -> np.ndarray:
         """
         Given a ligand RDKit molecule, extract a transformer-based feature vector using a pretrained
@@ -1321,17 +1324,27 @@ class LigandFeatureGenerator:
         - Return the feature vector as a NumPy array.
 
         Args:
-            rdkit_mol: RDKit molecule object.
-            transformer_feature_extractor: An initialized transformer feature extractor object
-                                        with a method `extract_features(smiles: str) -> np.ndarray`.
+            transformer_feature_extractor: An initialized transformer feature
+                extractor object with a method
+                `extract_features(smiles: str) -> np.ndarray`.
+            smiles: The SMILES string. If given, takes precedence over
+                extracting the canoncial SMILES from the RDKit mol instance.
+            rdkit_mol: RDKit molecule object, used to extract the SMILES string.
 
         Returns:
             A 1D NumPy array containing the extracted feature vector.
         """
+        if smiles is None and rdkit_mol is None:
+            raise ValueError("One of smiles and rdkit_mol must be given.")
+
         logger.info("Extracting transformer features from SMILES")
 
-        # Convert to canonical SMILES
-        canonical_smiles = MolToSmiles(rdkit_mol, canonical=True)
+        if smiles:
+            mol = MolFromSmiles(smiles)
+            canonical_smiles = MolToSmiles(mol, canonical=True)
+        else:
+            # Convert to canonical SMILES
+            canonical_smiles = MolToSmiles(rdkit_mol, canonical=True)
 
         # Extract features using the transformer model
         try:
@@ -1357,12 +1370,17 @@ class LigandFeatureGenerator:
         return features
 
     def from_molecule(
-        self, molecule: Molecule, rdkit_mol: Chem.Mol
+        self,
+        molecule: Molecule,
+        rdkit_mol: Chem.Mol,
+        smiles: str | None = None,
     ) -> "LigandFeatures":
         molecule = safely_remove_hydrogens(molecule)
         rdkit_vector = self._get_rdkit_vector(rdkit_mol)
         transformer_vector = self._get_transformer_vector(
-            rdkit_mol, self.transformer_feature_extractor
+            transformer_feature_extractor=self.transformer_feature_extractor,
+            smiles=smiles,
+            rdkit_mol=rdkit_mol,
         )
 
         # Scale the SMILES transformer encoder embedding
@@ -1549,6 +1567,7 @@ class ProteinFeatureGenerator:
 
         return seq
 
+    # TODO(philipp) build cache for this
     def _get_esm2_embedding(self, seq: str) -> np.ndarray:
         """
         Given a protein sequence across all protein chains, produce the ESM2 embedding for
@@ -1575,7 +1594,7 @@ class ProteinFeatureGenerator:
         batch_lens = (batch_tokens != self.esm_alphabet.padding_idx).sum(1)
 
         # Run the model to get embeddings from layer 33 as done previously
-        logger.info("Running ESM2 model to get embeddings from layer 33")
+        logger.debug("Running ESM2 model to get embeddings from layer 33")
         self.esm_model.eval()
         with torch.no_grad():
             results = self.esm_model(
@@ -1646,7 +1665,7 @@ class ProteinFeatureGenerator:
         ligand_nonh = ligand[ligand["atom_type"] != "H"].reset_index(drop=True)
 
         # create ligand non-H atom dictionary
-        ligand_nonh_dict = ligand_nonh.to_dict("index")
+        ligand_nonh_dict = ligand_nonh.to_dict("index")  # type: ignore
 
         # initialize lists to save IDs for residues and heteroatoms to keep in pocket file
         pocket_residues = []
@@ -1779,9 +1798,14 @@ class ProteinFeatureGenerator:
         return pocket_molecule
 
     def from_molecule(
-        self, full_protein_molecule: Molecule, ligand_molecule: Molecule
+        self,
+        full_protein_molecule: Molecule,
+        ligand_molecule: Molecule,
+        sequence: str | None = None,
     ) -> ProteinFeatures:
-        sequence = self._protein_mol_to_seq(full_protein_molecule)
+        if sequence is None:
+            sequence = self._protein_mol_to_seq(full_protein_molecule)
+
         esm2_embedding = self._get_esm2_embedding(sequence)
 
         pocket_protein_molecule = self._extract_protein_pocket(
@@ -2190,6 +2214,8 @@ class TAlphaDatasetLoader:
         protein_molecule: Molecule,
         openbabel_ligand: Molecule,
         rdkit_ligand: Chem.Mol,
+        protein_sequence: str | None = None,
+        smiles: str | None = None,
     ) -> list[dict]:
         logger.info("Generating protein features...")
         # TODO(philipp): think about whether this could be an issue for
@@ -2198,48 +2224,52 @@ class TAlphaDatasetLoader:
         # based on the molecule and this could be different between different
         # ligands/poses
         protein_features = self.protein_feature_generator.from_molecule(
-            protein_molecule, openbabel_ligand
+            protein_molecule, openbabel_ligand, sequence=protein_sequence
         )
 
         data_list = []
         data = self._collate_data_single_pair(
-            protein_features, openbabel_ligand, rdkit_ligand
+            protein_features,
+            openbabel_ligand,
+            rdkit_ligand,
+            smiles=smiles,
         )
         data_list.append(data)
 
         logger.info(f"Generated {len(data_list)} protein-ligand pairs")
         return data_list
 
-    def from_multiple_proteins(
-        self, protein_molecules: list[Molecule], ligand_molecules: list[Molecule]
-    ) -> list[dict]:
-        data_list = []
-        for protein_molecule, ligand_molecule in zip(
-            protein_molecules, ligand_molecules
-        ):
-            try:
-                logger.info(f"Generating protein features for {protein_molecule.title}")
-                protein_features = self.protein_feature_generator.from_molecule(
-                    protein_molecule, ligand_molecule
-                )
-
-                logger.info(f"Generating ligand features for {ligand_molecule.title}")
-                data = self._collate_data_single_pair(protein_features, ligand_molecule)
-                data_list.append(data)
-            except Exception as e:
-                logger.error(
-                    f"Error generating ligand features for {ligand_molecule.title}: {e}"
-                )
-                continue
-
-        logger.info(f"Generated {len(data_list)} protein-ligand pairs")
-        return data_list
+    # def from_multiple_proteins(
+    #     self, protein_molecules: list[Molecule], ligand_molecules: list[Molecule]
+    # ) -> list[dict]:
+    #     data_list = []
+    #     for protein_molecule, ligand_molecule in zip(
+    #         protein_molecules, ligand_molecules
+    #     ):
+    #         try:
+    #             logger.info(f"Generating protein features for {protein_molecule.title}")
+    #             protein_features = self.protein_feature_generator.from_molecule(
+    #                 protein_molecule, ligand_molecule
+    #             )
+    #
+    #             logger.info(f"Generating ligand features for {ligand_molecule.title}")
+    #             data = self._collate_data_single_pair(protein_features, ligand_molecule)
+    #             data_list.append(data)
+    #         except Exception as e:
+    #             logger.error(
+    #                 f"Error generating ligand features for {ligand_molecule.title}: {e}"
+    #             )
+    #             continue
+    #
+    #     logger.info(f"Generated {len(data_list)} protein-ligand pairs")
+    #     return data_list
 
     def _collate_data_single_pair(
         self,
         protein_features: ProteinFeatures,
         ligand_molecule: Molecule,
         rdkit_ligand_molecule: Chem.Mol,
+        smiles: str | None = None,
     ) -> dict | None:
         atom_coords_batch = torch.zeros(
             protein_features.full_coords.shape[0],  # Changed from size(0)
@@ -2248,7 +2278,7 @@ class TAlphaDatasetLoader:
         )
 
         ligand_features = self.ligand_feature_generator.from_molecule(
-            ligand_molecule, rdkit_ligand_molecule
+            ligand_molecule, rdkit_ligand_molecule, smiles=smiles
         )
 
         complex_features = self.complex_feature_generator.from_ligand_protein_features(
@@ -2700,6 +2730,8 @@ def generate_features(
     protein: Molecule | list[Molecule],
     openbabel_ligand: Molecule,
     rdkit_ligand: Chem.Mol,
+    protein_sequence: str | None = None,
+    smiles: str | None = None,
     esm_model_name: ESMModel = ESMModel.ESM2_T36_3B_UR50D,
     device: str | None = None,
     smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
@@ -2718,13 +2750,15 @@ def generate_features(
             protein_molecule=protein,
             openbabel_ligand=openbabel_ligand,
             rdkit_ligand=rdkit_ligand,
+            protein_sequence=protein_sequence,
+            smiles=smiles,
         )
     else:
         raise RuntimeError("Blocking of code path for now.")
-        return dataset_loader.from_multiple_proteins(
-            protein_molecules=protein,
-            ligand_molecules=ligands,
-        )
+        # return dataset_loader.from_multiple_proteins(
+        #     protein_molecules=protein,
+        #     ligand_molecules=ligands,
+        # )
 
 
 def create_or_load_smiles_transformer_vocab(
@@ -2743,9 +2777,12 @@ def create_or_load_smiles_transformer_vocab(
         else:
             logger.info("Generating SMILES vocabulary")
             with smart_open(smiles_transformer_vocab_file, "wt") as f:
-                smiles_list = pd.read_parquet(smiles_transformer_training_data_file)[
-                    "SMILES"
-                ].tolist()
+                smiles_list = cast(
+                    list[str],
+                    pd.read_parquet(smiles_transformer_training_data_file)[
+                        "SMILES"
+                    ].tolist(),
+                )
 
                 smiles_transformer_vocab = SMILESTransformerVocab.from_smiles(
                     smiles_list
@@ -2782,8 +2819,8 @@ def safely_remove_hydrogens(mol: Molecule) -> Molecule:
 
 def load_esm_model(esm_model_name: str) -> tuple[Any, Any, Any]:
     """Load the ESM model and alphabet."""
-    esm_model, esm_alphabet = torch.hub.load(
-        "facebookresearch/esm:main", esm_model_name
+    esm_model, esm_alphabet = cast(
+        tuple[Any, Any], torch.hub.load("facebookresearch/esm:main", esm_model_name)
     )
     esm_batch_converter = esm_alphabet.get_batch_converter()
 

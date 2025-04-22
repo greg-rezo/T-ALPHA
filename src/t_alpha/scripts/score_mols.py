@@ -68,6 +68,8 @@ def main(args) -> np.ndarray:
         protein=protein_molecule,
         openbabel_ligand=ligand_openbabel_mol,
         rdkit_ligand=ligand_rdkit_mol,
+        protein_sequence=None,
+        smiles=None,
     )
     metadata = [
         {
