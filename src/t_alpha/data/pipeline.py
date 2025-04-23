@@ -1589,7 +1589,7 @@ class ProteinFeatureGenerator:
         - The ESM2 model weights will be automatically downloaded by torch.hub if not cached.
         """
         # Convert the single protein sequence into tokens
-        logger.info("Converting protein sequence into tokens")
+        logger.info(f"Converting protein sequence of length {len(seq)} into tokens")
         _, _, batch_tokens = self.esm_batch_converter([("1", seq)])
         batch_lens = (batch_tokens != self.esm_alphabet.padding_idx).sum(1)
 

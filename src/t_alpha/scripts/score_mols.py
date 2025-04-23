@@ -73,18 +73,6 @@ def main(args) -> np.ndarray:
         protein_sequence=args.protein_sequence,
         smiles=args.smiles,
     )
-    metadata = [
-        {
-            "protein_graph_edges": data["protein_graph"].edge_index.size(1),
-            "protein_graph_nodes": data["protein_graph"].node_coords.size(0),
-            "ligand_graph_edges": data["ligand_graph"].edge_index.size(1),
-            "ligand_graph_nodes": data["ligand_graph"].node_coords.size(0),
-            "complex_graph_edges": data["complex_graph"].edge_index.size(1),
-            "complex_graph_nodes": data["complex_graph"].node_coords.size(0),
-            "error": "",
-        }
-        for data in data_list
-    ]
 
     scores = score_data(
         data_list=data_list,
@@ -93,7 +81,7 @@ def main(args) -> np.ndarray:
     )
 
     logger.info(f"Scores: {scores}")
-    return scores, metadata
+    return scores
 
 
 if __name__ == "__main__":

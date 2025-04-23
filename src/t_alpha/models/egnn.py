@@ -423,29 +423,10 @@ class EGNN(nn.Module):
         # Step 1: Embed the input node features into the hidden feature size
         h = self.embedding_in(h)
 
-        # DEBUGGING NOTES: it seems that the activation and coordinates explode
-        # during graph convolutions on the ligand-complex network. Not sure why
-        # this is the case
-        acts = list()
-        coords = list()
-        dists = list()
-
         # Step 2: Pass through each GCL layer, updating the node features and coordinates.
         # Each layer updates both the features (h) and positions (x) by using the connectivity and edge features.
         for i in range(self.n_layers):
-            acts.append(h)
-            coords.append(x)
-            distances = torch.cdist(x, x)
-            mask = ~torch.eye(x.size(0), dtype=torch.bool, device=x.device)
-            dists.append(distances[mask])
             h, x, _ = self._modules["gcl_%d" % i](h, edges, x, edge_attr=edge_attr)
-            if h.isnan().sum() > 0 or x.isnan().sum() > 0:
-                print(
-                    "Average activations per layer",
-                    [t.abs().mean().item() for t in acts],
-                )
-                print("Minimal distance per layer:", [d.min().item() for d in dists])
-                # breakpoint()
 
         # Step 3: Project the hidden node features to the output size using the final embedding layer
         h = self.embedding_out(h)
