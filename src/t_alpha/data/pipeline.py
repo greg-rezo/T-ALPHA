@@ -1526,6 +1526,7 @@ class ProteinFeatureGenerator:
             )
 
         logger.info(f"Loading ESM2 model from huggingface: {esm_model_name}")
+        # TODO(philipp): pretty sure we are only running ESM2 on CPU currently, enable GPU inference
         if use_cache:
             self.esm_model, self.esm_alphabet, self.esm_batch_converter = (
                 load_esm_model_with_cache(self.esm_model_name.value)
@@ -1534,6 +1535,16 @@ class ProteinFeatureGenerator:
             self.esm_model, self.esm_alphabet, self.esm_batch_converter = (
                 load_esm_model(self.esm_model_name.value)
             )
+
+    def __hash__(self) -> int:
+        # NOTE: required for making LRU cache working on `_get_esm2_embedding`
+        return hash((self.esm_model_name.value, self.device))
+
+    def __eq__(self, other) -> bool:
+        # NOTE: required for making LRU cache working on `_get_esm2_embedding`
+        return (
+            self.esm_model_name == other.esm_model_name and self.device == other.device
+        )
 
     @staticmethod
     def _protein_mol_to_seq(protein_molecule: Molecule) -> str:
@@ -1567,17 +1578,23 @@ class ProteinFeatureGenerator:
 
         return seq
 
-    # TODO(philipp) build cache for this
+    @functools.lru_cache()
     def _get_esm2_embedding(self, seq: str) -> np.ndarray:
-        """
-        Given a protein sequence across all protein chains, produce the ESM2 embedding for
-        that combined sequence.
+        """Calculate ESM2 embedding vector.
+
+        Given a protein sequence across all protein chains, produce the ESM2
+        embedding for that combined sequence.
 
         This function:
         - Loads the ESM2 model and alphabet as done in the CSV-based code.
         - Converts the sequence into tokens with the model's batch_converter.
         - Runs the ESM2 model to obtain the per-residue representations.
         - Computes the average over residues to obtain a single embedding vector.
+
+        The function has a cache. The cache is shared between different
+        instances of ProteinFeatureGenerator as long as the input arguments are
+        identical. This is mainly useful in a scenarion when running many
+        ligands against a small number of proteins.
 
         Returns:
         A 1D NumPy array containing the ESM2 embedding vector.
@@ -2239,30 +2256,67 @@ class TAlphaDatasetLoader:
         logger.info(f"Generated {len(data_list)} protein-ligand pairs")
         return data_list
 
-    # def from_multiple_proteins(
-    #     self, protein_molecules: list[Molecule], ligand_molecules: list[Molecule]
-    # ) -> list[dict]:
-    #     data_list = []
-    #     for protein_molecule, ligand_molecule in zip(
-    #         protein_molecules, ligand_molecules
-    #     ):
-    #         try:
-    #             logger.info(f"Generating protein features for {protein_molecule.title}")
-    #             protein_features = self.protein_feature_generator.from_molecule(
-    #                 protein_molecule, ligand_molecule
-    #             )
-    #
-    #             logger.info(f"Generating ligand features for {ligand_molecule.title}")
-    #             data = self._collate_data_single_pair(protein_features, ligand_molecule)
-    #             data_list.append(data)
-    #         except Exception as e:
-    #             logger.error(
-    #                 f"Error generating ligand features for {ligand_molecule.title}: {e}"
-    #             )
-    #             continue
-    #
-    #     logger.info(f"Generated {len(data_list)} protein-ligand pairs")
-    #     return data_list
+    def from_multiple_proteins(
+        self,
+        protein_molecules: list[Molecule],
+        openbabel_ligands: list[Molecule],
+        rdkit_ligands: list[Chem.Mol],
+        protein_sequences: list[str | None] | None = None,
+        smiles_list: list[str | None] | None = None,
+    ) -> list[dict]:
+        # process inputs
+        if protein_sequences is None:
+            protein_sequences = [None for _ in range(len(protein_molecules))]
+        if smiles_list is None:
+            smiles_list = [None for _ in range(len(protein_molecules))]
+
+        # validate matching lengths
+        if (
+            not len(protein_molecules)
+            == len(openbabel_ligands)
+            == len(rdkit_ligands)
+            == len(protein_sequences)
+            == len(smiles_list)
+        ):
+            raise ValueError("Expected all inputs to be of same length.")
+
+        data_list = []
+        for (
+            protein_molecule,
+            openbabel_ligand,
+            rdkit_ligand,
+            protein_sequence,
+            smiles,
+        ) in zip(
+            protein_molecules,
+            openbabel_ligands,
+            rdkit_ligands,
+            protein_sequences,
+            smiles_list,
+        ):
+            try:
+                logger.info(f"Generating protein features for {protein_molecule.title}")
+                protein_features = self.protein_feature_generator.from_molecule(
+                    protein_molecule, openbabel_ligand, sequence=protein_sequence
+                )
+
+                logger.info(f"Generating ligand features for {openbabel_ligand.title}")
+                data = self._collate_data_single_pair(
+                    protein_features,
+                    ligand_molecule=openbabel_ligand,
+                    rdkit_ligand_molecule=rdkit_ligand,
+                    smiles=smiles,
+                )
+                data_list.append(data)
+            except Exception as e:
+                logger.exception(
+                    f"Error generating ligand features for "
+                    f"{openbabel_ligand.title}: {e}"
+                )
+                continue
+
+        logger.info(f"Generated {len(data_list)} protein-ligand pairs")
+        return data_list
 
     def _collate_data_single_pair(
         self,
@@ -2270,7 +2324,7 @@ class TAlphaDatasetLoader:
         ligand_molecule: Molecule,
         rdkit_ligand_molecule: Chem.Mol,
         smiles: str | None = None,
-    ) -> dict | None:
+    ) -> dict:
         atom_coords_batch = torch.zeros(
             protein_features.full_coords.shape[0],  # Changed from size(0)
             dtype=torch.long,
@@ -2639,6 +2693,7 @@ def score_data(
 
     # Update keys in parameter file
     with tempfile.TemporaryDirectory() as temp_dir:
+        # TODO(philipp) write this file to cache to avoid re-running this
         tmp_ckpt_path = Path(temp_dir) / "updated_T-ALPHA_params.ckpt"
         update_parameter_keys(t_alpha_model_file, tmp_ckpt_path)
 
@@ -2688,46 +2743,8 @@ def embed_pybel_mol(mol: Molecule) -> Molecule | None:
     return pybel_mol_from_rdkit_mol(rdkit_mol)
 
 
-# def score_compounds_single_protein_from_files(
-#     protein_file: Path,
-#     ligand_file: Path,
-#     esm_model_name: ESMModel,
-#     device: str | None = None,
-#     batch_size: int = 1,
-#     t_alpha_model_file: Path = DEFAULT_T_ALPHA_MODEL_FILE,
-#     smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
-# ) -> npt.NDArray[np.float_]:
-#     # Add hydrogens to the protein
-#     protein_molecule = next(pybel.readfile("pdb", str(protein_file)))
-#     protein_molecule.OBMol.AddHydrogens()
-
-#     # Add hydrogens to the ligand
-#     ligand_format = ligand_file.suffix.lstrip(".")
-#     ligand_mols = []
-#     for ligand_molecule in list(pybel.readfile(ligand_format, str(ligand_file))):
-#         embedded_ligand = embed_pybel_mol(ligand_molecule)
-#         if embedded_ligand is None:
-#             continue
-#         ligand_mols.append(embedded_ligand)
-
-#     logger.info(
-#         f"Loaded protein with {len(protein_molecule.atoms)} atoms and "
-#         f"{len(ligand_mols)} ligands"
-#     )
-
-#     return score_compounds_single_protein(
-#         protein_molecule=protein_molecule,
-#         ligand_molecules=ligand_mols,
-#         esm_model_name=esm_model_name,
-#         device=device,
-#         batch_size=batch_size,
-#         t_alpha_model_file=t_alpha_model_file,
-#         smiles_transformer_model_file=smiles_transformer_model_file,
-#     )
-
-
 def generate_features(
-    protein: Molecule | list[Molecule],
+    protein: Molecule,
     openbabel_ligand: Molecule,
     rdkit_ligand: Chem.Mol,
     protein_sequence: str | None = None,
@@ -2745,20 +2762,13 @@ def generate_features(
         smiles_transformer_model_file=smiles_transformer_model_file,
     )
 
-    if isinstance(protein, Molecule):
-        return dataset_loader.from_single_protein(
-            protein_molecule=protein,
-            openbabel_ligand=openbabel_ligand,
-            rdkit_ligand=rdkit_ligand,
-            protein_sequence=protein_sequence,
-            smiles=smiles,
-        )
-    else:
-        raise RuntimeError("Blocking of code path for now.")
-        # return dataset_loader.from_multiple_proteins(
-        #     protein_molecules=protein,
-        #     ligand_molecules=ligands,
-        # )
+    return dataset_loader.from_single_protein(
+        protein_molecule=protein,
+        openbabel_ligand=openbabel_ligand,
+        rdkit_ligand=rdkit_ligand,
+        protein_sequence=protein_sequence,
+        smiles=smiles,
+    )
 
 
 def create_or_load_smiles_transformer_vocab(

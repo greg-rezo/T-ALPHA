@@ -1,4 +1,3 @@
-import logging
 import torch
 from torch import nn
 from torch.nn import (
@@ -13,8 +12,6 @@ from torch_geometric.utils import to_dense_batch
 from t_alpha.models.egnn_encoder import EGNNEncoder
 from t_alpha.models.surface_convnet import SurfaceConvNet
 from t_alpha.models.utils import AttentionPooling, masked_mean_pool
-
-logger = logging.getLogger(__name__)
 
 
 class MetaModel(nn.Module):
