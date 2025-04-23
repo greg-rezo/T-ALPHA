@@ -13,6 +13,7 @@ from typing import ClassVar, Literal, cast, Any
 import copy
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -1048,10 +1049,8 @@ class TransformerFeatureExtractor(torch.nn.Module):
 
 class ConnectedGraphFeatureScaler:
     def __init__(self, scaler_file: Path):
-        with open(scaler_file, "rb") as f:
-            scalers = pickle.load(f)
-            self.node_scaler = scalers["node_scaler"]
-            self.edge_scaler = scalers["edge_scaler"]
+        self.node_scaler = _load_scaler(scaler_file, "node_scaler")
+        self.edge_scaler = _load_scaler(scaler_file, "edge_scaler")
 
         self.node_continuous_indices = [
             -4,
@@ -1102,9 +1101,7 @@ class ConnectedGraphFeatureScaler:
 
 class UnconnectedGraphFeatureScaler:
     def __init__(self, scaler_file: Path):
-        with open(scaler_file, "rb") as f:
-            scalers = pickle.load(f)
-            self.protein_node_scaler = scalers["protein_node_scaler"]
+        self.protein_node_scaler = _load_scaler(scaler_file, "protein_node_scaler")
 
         self.node_continuous_indices = [
             -4,
@@ -1253,19 +1250,20 @@ class LigandFeatureGenerator:
         logger.info("Scaling RDKit vector")
 
         # Load the pre-trained scaler
-        with open(scaler_file, "rb") as f:
-            rdkit_scaler = pickle.load(f)["rdkit_scaler"]
+        rdkit_scaler = _load_scaler(scaler_file, "rdkit_scaler")
 
         # Ensure the vector is 2D for the scaler
         if rdkit_vector.ndim == 1:
             rdkit_vector = rdkit_vector.reshape(1, -1)
 
         # Scale the vector
-        standardized_vector = rdkit_scaler.transform(rdkit_vector)
+        standardized_vector = cast(npt.NDArray, rdkit_scaler.transform(rdkit_vector))
 
         # Handle NaN values by replacing them with the corresponding mean
         if np.isnan(standardized_vector).any():
-            feature_means = rdkit_scaler.mean_  # Means of the features from the scaler
+            feature_means = cast(
+                npt.NDArray, rdkit_scaler.mean_
+            )  # Means of the features from the scaler
             standardized_vector = np.where(
                 np.isnan(standardized_vector), feature_means, standardized_vector
             )
@@ -1295,15 +1293,16 @@ class LigandFeatureGenerator:
         """
         logger.info("Scaling transformer embedding")
         # Load the pre-trained scaler
-        with open(scaler_file, "rb") as f:
-            roberta_scaler = pickle.load(f)["roberta_scaler"]
+        roberta_scaler = _load_scaler(scaler_file, "roberta_scaler")
 
         # Ensure the embedding is 2D for the scaler
         if transformer_vector.ndim == 1:
             transformer_vector = transformer_vector.reshape(1, -1)
 
         # Scale the vector
-        standardized_vector = roberta_scaler.transform(transformer_vector)
+        standardized_vector = cast(
+            npt.NDArray, roberta_scaler.transform(transformer_vector)
+        )
 
         # Squeeze back to 1D array if applicable
         return standardized_vector.squeeze()
@@ -1459,8 +1458,7 @@ class ProteinFeatures(BaseModel):
 
 class ProteinSequenceScaler:
     def __init__(self, scaler_file: Path):
-        with open(scaler_file, "rb") as f:
-            self.esm2_scaler = pickle.load(f)["esm2_scaler"]
+        self.esm2_scaler = _load_scaler(scaler_file, "esm2_scaler")
 
     def scale_esm2_embedding(self, esm2_embedding: np.ndarray) -> np.ndarray:
         """
@@ -1485,7 +1483,9 @@ class ProteinSequenceScaler:
             esm2_embedding = esm2_embedding.reshape(1, -1)
 
         # Scale the embedding
-        standardized_embedding = self.esm2_scaler.transform(esm2_embedding)
+        standardized_embedding = cast(
+            npt.NDArray, self.esm2_scaler.transform(esm2_embedding)
+        )
 
         # Return as a 1D array if it was originally 1D
         if standardized_embedding.shape[0] == 1:
@@ -2872,3 +2872,11 @@ def load_esm_model(esm_model_name: str) -> tuple[Any, Any, Any]:
 def load_esm_model_with_cache(esm_model_name: str) -> tuple[Any, Any, Any]:
     """Load the ESM model and alphabet with in-memory cache."""
     return load_esm_model(esm_model_name)
+
+
+@functools.cache
+def _load_scaler(scaler_file: Path, scaler_name: str) -> StandardScaler:
+    # TODO: long term, probably move the scalers to ONNX
+    with open(scaler_file, "rb") as f:
+        scalers = pickle.load(f)
+        return scalers[scaler_name]
