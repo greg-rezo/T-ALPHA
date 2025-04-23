@@ -1024,6 +1024,7 @@ class TransformerFeatureExtractor(torch.nn.Module):
 
         self.model.eval()
 
+    # TODO (philipp): write cache
     def extract_features(self, smiles: str) -> torch.Tensor:
         # Tokenize the SMILES string and pad it to the block size
         smiles = "[CLS]" + smiles.strip() + "[EOS]"
@@ -2744,6 +2745,7 @@ def embed_pybel_mol(mol: Molecule) -> Molecule | None:
 
 
 def generate_features(
+    *,
     protein: Molecule,
     openbabel_ligand: Molecule,
     rdkit_ligand: Chem.Mol,
@@ -2768,6 +2770,35 @@ def generate_features(
         rdkit_ligand=rdkit_ligand,
         protein_sequence=protein_sequence,
         smiles=smiles,
+    )
+
+
+def generate_features_in_batch(
+    *,
+    proteins: list[Molecule],
+    openbabel_ligands: list[Molecule],
+    rdkit_ligands: list[Chem.Mol],
+    protein_sequences: list[str | None] | None = None,
+    smiles_list: list[str | None] | None = None,
+    esm_model_name: ESMModel = ESMModel.ESM2_T36_3B_UR50D,
+    device: str | None = None,
+    smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
+) -> list[dict]:
+    logger.info("Generating T-ALPHA features...")
+    device = device or get_device()
+
+    dataset_loader = TAlphaDatasetLoader(
+        esm_model_name=esm_model_name,
+        device=device,
+        smiles_transformer_model_file=smiles_transformer_model_file,
+    )
+
+    return dataset_loader.from_multiple_proteins(
+        protein_molecules=proteins,
+        openbabel_ligands=openbabel_ligands,
+        rdkit_ligands=rdkit_ligands,
+        protein_sequences=protein_sequences,
+        smiles_list=smiles_list,
     )
 
 
