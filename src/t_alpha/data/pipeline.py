@@ -2259,12 +2259,37 @@ class TAlphaDatasetLoader:
 
     def from_multiple_proteins(
         self,
-        protein_molecules: list[Molecule],
-        openbabel_ligands: list[Molecule],
-        rdkit_ligands: list[Chem.Mol],
+        protein_molecules: list[Molecule | None],
+        openbabel_ligands: list[Molecule | None],
+        rdkit_ligands: list[Chem.Mol | None],
         protein_sequences: list[str | None] | None = None,
         smiles_list: list[str | None] | None = None,
     ) -> list[dict | None]:
+        """Featurize multiple systems in batch.
+
+        `protein_molecules`, `openbabel_ligands` and `rdkit_ligands` are
+        required inputs. The function accepts missing inputs, but will not
+        attempt the featurization.
+
+        Args:
+          protein_molecules: The OpenBabel protein molecules.
+          openbabel_ligands: The OpenBabel ligand molecules.
+          rdkit_ligands: The RDKit ligand molecules.
+          protein_sequences: The list of protein sequences for the system. While
+            this input is optional, it is recommended to give the full protein
+            sequence of the system under investigation. For each missing input,
+            the sequence will be extracted from the protein molecule, which tends
+            to negatively impact performance.
+          smiles_list: The list of canonical SMILES strings for the given ligand.
+            While this input is optional, it is recommended to pass in the
+            expected SMILES string for optimal performance. If not given will be
+            extracted from the RDKit molecule.
+
+        Returns:
+          List of extracted features. If any of the required inputs are missing
+          or if featurization is failing, the respective element in the output
+          list is set to None.
+        """
         # process inputs
         if protein_sequences is None:
             protein_sequences = [None for _ in range(len(protein_molecules))]
@@ -2295,6 +2320,16 @@ class TAlphaDatasetLoader:
             protein_sequences,
             smiles_list,
         ):
+            # robustness to missing inputs
+            if (
+                protein_molecule is None
+                or openbabel_ligand is None
+                or rdkit_ligand is None
+            ):
+                logger.debug("missing inputs, ")
+                data_list.append(None)
+                continue
+
             try:
                 logger.info(f"Generating protein features for {protein_molecule.title}")
                 protein_features = self.protein_feature_generator.from_molecule(
@@ -2311,7 +2346,8 @@ class TAlphaDatasetLoader:
                 data_list.append(data)
             except Exception as e:
                 logger.exception(
-                    f"Error generating ligand features for "
+                    f"Error generating ligand features for protein "
+                    f"{protein_molecule.title} and ligand "
                     f"{openbabel_ligand.title}: {e}"
                 )
                 data_list.append(None)
@@ -2773,11 +2809,12 @@ def generate_features(
     )
 
 
+# TODO wrap input into dataclass for simpler logic
 def generate_features_in_batch(
     *,
-    proteins: list[Molecule],
-    openbabel_ligands: list[Molecule],
-    rdkit_ligands: list[Chem.Mol],
+    proteins: list[Molecule | None],
+    openbabel_ligands: list[Molecule | None],
+    rdkit_ligands: list[Chem.Mol | None],
     protein_sequences: list[str | None] | None = None,
     smiles_list: list[str | None] | None = None,
     esm_model_name: ESMModel = ESMModel.ESM2_T36_3B_UR50D,
