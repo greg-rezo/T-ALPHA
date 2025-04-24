@@ -2264,7 +2264,7 @@ class TAlphaDatasetLoader:
         rdkit_ligands: list[Chem.Mol],
         protein_sequences: list[str | None] | None = None,
         smiles_list: list[str | None] | None = None,
-    ) -> list[dict]:
+    ) -> list[dict | None]:
         # process inputs
         if protein_sequences is None:
             protein_sequences = [None for _ in range(len(protein_molecules))]
@@ -2314,7 +2314,7 @@ class TAlphaDatasetLoader:
                     f"Error generating ligand features for "
                     f"{openbabel_ligand.title}: {e}"
                 )
-                continue
+                data_list.append(None)
 
         logger.info(f"Generated {len(data_list)} protein-ligand pairs")
         return data_list
@@ -2685,7 +2685,7 @@ def get_device() -> str:
 
 def score_data(
     t_alpha_model_file: Path,
-    data_list: list[dict],
+    data_list: list[dict | None],
     batch_size: int = 1,
     device: str | None = None,
 ) -> np.ndarray:
@@ -2725,7 +2725,7 @@ def score_data(
             outputs = []
             for data in data_list:
                 if data is None:
-                    outputs.append(None)
+                    outputs.append(np.nan)
                 else:
                     output = lightning_model.model(data)
                     outputs.append(output.cpu().numpy().flatten()[0])
@@ -2783,7 +2783,7 @@ def generate_features_in_batch(
     esm_model_name: ESMModel = ESMModel.ESM2_T36_3B_UR50D,
     device: str | None = None,
     smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
-) -> list[dict]:
+) -> list[dict | None]:
     logger.info("Generating T-ALPHA features...")
     device = device or get_device()
 
