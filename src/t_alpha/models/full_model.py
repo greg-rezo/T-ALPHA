@@ -428,8 +428,8 @@ class MetaModel(nn.Module):
             combined_pooled_protein_transformer_output = torch.cat(
                 [
                     protein_surface_transformer_output,
-                    pooled_protein_graph_transformer_output,
                     protein_sequence_transformer_output,
+                    pooled_protein_graph_transformer_output,
                 ],
                 dim=1,
             ).permute(0, 2, 1)
@@ -437,8 +437,8 @@ class MetaModel(nn.Module):
         elif not self.use_protein_surface:
             combined_pooled_protein_transformer_output = torch.cat(
                 [
-                    pooled_protein_graph_transformer_output,
                     protein_sequence_transformer_output,
+                    pooled_protein_graph_transformer_output,
                 ],
                 dim=1,
             ).permute(0, 2, 1)
@@ -554,8 +554,8 @@ class MetaModel(nn.Module):
             combined_pooled_ligand_transformer_output = torch.cat(
                 [
                     ligand_properties_transformer_output,
-                    pooled_ligand_graph_transformer_output,
                     ligand_sequence_transformer_output,
+                    pooled_ligand_graph_transformer_output,
                 ],
                 dim=1,
             ).permute(0, 2, 1)
@@ -563,8 +563,8 @@ class MetaModel(nn.Module):
         elif not self.use_ligand_properties:
             combined_pooled_ligand_transformer_output = torch.cat(
                 [
-                    pooled_ligand_graph_transformer_output,
                     ligand_sequence_transformer_output,
+                    pooled_ligand_graph_transformer_output,
                 ],
                 dim=1,
             ).permute(0, 2, 1)

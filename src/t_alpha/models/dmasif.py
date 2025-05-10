@@ -73,7 +73,8 @@ class dMaSIF(nn.Module):
         features = self.dropout(self.features(P))
         P["input_features"] = features
 
-        torch.cuda.synchronize(device=features.device)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device=features.device)
 
         # prepares for the quasi-geodesic convolution
         self.conv.load_locally_oriented_bases(

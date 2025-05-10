@@ -1,6 +1,6 @@
 import argparse
 
-from src.training.train_model import train_model
+from t_alpha.training.train_model import train_model
 
 
 def parse_args():

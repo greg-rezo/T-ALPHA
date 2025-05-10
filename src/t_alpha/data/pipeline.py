@@ -4,13 +4,16 @@ import importlib.resources
 import logging
 import math
 import pickle
+import functools
 import re
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import ClassVar, Literal, cast, Any
+import copy
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -24,7 +27,15 @@ from pydantic import BaseModel, ConfigDict
 from pykeops.torch import LazyTensor
 from pykeops.torch.cluster import grid_cluster
 from rdkit import RDLogger
-from rdkit.Chem import AddHs, Descriptors, Mol, RemoveHs, SDWriter
+from rdkit import Chem
+from rdkit.Chem import (
+    AddHs,
+    Descriptors,
+    Mol,
+    RemoveHs,
+    SDWriter,
+    RemoveStereochemistry,
+)
 from rdkit.Chem.rdDistGeom import EmbedMolecule, ETKDGv3
 from rdkit.Chem.rdForceFieldHelpers import MMFFOptimizeMolecule
 from rdkit.Chem.rdmolfiles import (
@@ -37,6 +48,7 @@ from sklearn.discriminant_analysis import StandardScaler
 from smart_open import open as smart_open
 from torch.nn import functional as F
 from torch_geometric.data import Batch, Data
+import requests
 
 from t_alpha.models.full_model import MetaModel
 from t_alpha.training.lightning_module import MetaModelLightning
@@ -44,10 +56,30 @@ from t_alpha.utils.checkpoint_utils import update_parameter_keys
 
 SRC_ROOT = Path(__file__).parent.parent
 RESOURCES_BASE = "t_alpha.resources"
-DEFAULT_SMILES_TRANSFORMER_MODEL_FILE = Path("SMILES_transformer_params.pt")
-DEFAULT_T_ALPHA_MODEL_FILE = Path("T-ALPHA_params.ckpt")
+
+T_ALPHA_CACHE_DIR = Path.home() / ".cache" / "t_alpha"
+DEFAULT_SMILES_TRANSFORMER_MODEL_FILE = (
+    T_ALPHA_CACHE_DIR / "SMILES_transformer_params.pt"
+)
+DEFAULT_T_ALPHA_MODEL_FILE = T_ALPHA_CACHE_DIR / "T-ALPHA_params.ckpt"
 
 logger = logging.getLogger(__name__)
+
+
+def load_t_alpha_files():
+    T_ALPHA_CACHE_DIR.mkdir(exist_ok=True)
+
+    if not DEFAULT_T_ALPHA_MODEL_FILE.exists():
+        r = requests.get(
+            "https://zenodo.org/records/14514685/files/T-ALPHA_params.ckpt?download=1"
+        )
+        DEFAULT_T_ALPHA_MODEL_FILE.write_bytes(r.content)
+
+    if not DEFAULT_SMILES_TRANSFORMER_MODEL_FILE.exists():
+        r = requests.get(
+            "https://zenodo.org/records/14516013/files/Transformer_Encoder_for_SMILES.pt?download=1"
+        )
+        DEFAULT_SMILES_TRANSFORMER_MODEL_FILE.write_bytes(r.content)
 
 
 def to_tensor(
@@ -367,7 +399,7 @@ class GraphFeaturizer:
     def get_node_features(
         self,
         molecule: Molecule,
-        source: str = "ligand",
+        source: Literal["ligand", "protein"] = "ligand",
         complex_bool: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         logger.info(f"Generating node features for molecule {source=} {complex_bool=}")
@@ -523,7 +555,7 @@ class GraphFeaturizer:
         )
 
         # Remove hydrogens from the molecule
-        molecule.OBMol.DeleteHydrogens()
+        molecule = safely_remove_hydrogens(molecule)
 
         edge_idx, edge_attr = [], []
         for bond in openbabel.OBMolBondIter(molecule.OBMol):
@@ -603,18 +635,23 @@ class GraphFeaturizer:
         return edge_idx, edge_attr
 
     def get_distance_based_edges(
-        self, protein, ligand, distance_threshold=4.5
+        self,
+        protein,
+        ligand,
+        ligand_atom_idx_offset: int,
+        distance_threshold: float = 4.5,
     ) -> tuple[
         list, list
     ]:  # 4.5 A corresponds to hydrophobic threshold deined by ProLIF
         # remove hydrogens from the protein and ligand
-        protein.OBMol.DeleteHydrogens()
-        ligand.OBMol.DeleteHydrogens()
+        protein = safely_remove_hydrogens(protein)
+        ligand = safely_remove_hydrogens(ligand)
 
         # Get the coordinates and electronegativity of the protein atoms
         logger.info("Getting protein coordinates and electronegativity")
         protein_coords, protein_electronegativities, protein_charges = [], [], []
-        for atom in openbabel.OBMolAtomIter(protein.OBMol):
+        for i, atom in enumerate(openbabel.OBMolAtomIter(protein.OBMol)):
+            assert i == atom.GetIdx() - 1
             if atom.GetAtomicNum() == 1:
                 continue  # Skip hydrogen atoms
 
@@ -627,7 +664,8 @@ class GraphFeaturizer:
         # Get the coordinates and electronegativity of the ligand atoms
         logger.info("Getting ligand coordinates and electronegativity")
         ligand_coords, ligand_electronegativities, ligand_charges = [], [], []
-        for atom in openbabel.OBMolAtomIter(ligand.OBMol):
+        for i, atom in enumerate(openbabel.OBMolAtomIter(ligand.OBMol)):
+            assert i == atom.GetIdx() - 1
             if atom.GetAtomicNum() == 1:
                 continue  # Skip hydrogen atoms
 
@@ -651,7 +689,8 @@ class GraphFeaturizer:
         logger.info("Generating distance-based edges")
         edge_idx, edge_attr = [], []
         for i, j in zip(protein_indices, ligand_indices):
-            ligand_index = j + len(protein_coords)
+            assert i < ligand_atom_idx_offset
+            ligand_index = j + ligand_atom_idx_offset
 
             distance = distances[i, j]
             electronegativity_difference = np.abs(
@@ -675,17 +714,36 @@ class GraphFeaturizer:
         return edge_idx, edge_attr
 
     def get_protein_ligand_complex_edges(
-        self, protein: Molecule, ligand: Molecule
+        self,
+        protein: Molecule,
+        ligand: Molecule,
+        expected_protein_node_count: int | None = None,  # TODO remove
+        expected_ligand_node_count: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
+        # preprocess protein and ligand
+        protein = protein.clone
+        ligand = ligand.clone
+
+        protein = safely_remove_hydrogens(protein)
+        ligand = safely_remove_hydrogens(ligand)
+
+        offset = protein.OBMol.NumAtoms()
+        logger.debug(f"Found {offset} atoms in protein.")
+
+        # optional validation against node feature counts:
+        if expected_protein_node_count:
+            assert protein.OBMol.NumAtoms() == expected_protein_node_count
+
+        if expected_ligand_node_count:
+            assert ligand.OBMol.NumAtoms() == expected_ligand_node_count
+
         # Get bond-based edges for protein and ligand
         protein_edges, protein_edge_attrs = self.get_bond_based_edges(protein)
         ligand_edges, ligand_edge_attrs = self.get_bond_based_edges(ligand)
 
         # Offset ligand atom indices
-        ligand_edges_offset = [
-            (i + protein.OBMol.NumAtoms(), j + protein.OBMol.NumAtoms())
-            for i, j in ligand_edges
-        ]
+        ligand_edges = [(i + offset, j + offset) for i, j in ligand_edges]
+        assert np.asarray(protein_edges).max() < offset
 
         # Assign binary interaction labels
         logger.info("Assigning binary interaction labels")
@@ -698,14 +756,14 @@ class GraphFeaturizer:
 
         # Get distance-based edges between protein and ligand
         protein_ligand_edges, protein_ligand_attrs = self.get_distance_based_edges(
-            protein, ligand
+            protein, ligand, ligand_atom_idx_offset=offset
         )
         protein_ligand_attrs = [
             (attr + [1]) for attr in protein_ligand_attrs
         ]  # 1 for protein-ligand
 
         # Combine all edges
-        all_edges = np.array(protein_edges + ligand_edges_offset + protein_ligand_edges)
+        all_edges = np.array(protein_edges + ligand_edges + protein_ligand_edges)
         all_edge_attrs = np.array(
             protein_edge_attrs + ligand_edge_attrs + protein_ligand_attrs
         )
@@ -967,6 +1025,7 @@ class TransformerFeatureExtractor(torch.nn.Module):
 
         self.model.eval()
 
+    # TODO (philipp): write cache
     def extract_features(self, smiles: str) -> torch.Tensor:
         # Tokenize the SMILES string and pad it to the block size
         smiles = "[CLS]" + smiles.strip() + "[EOS]"
@@ -990,10 +1049,8 @@ class TransformerFeatureExtractor(torch.nn.Module):
 
 class ConnectedGraphFeatureScaler:
     def __init__(self, scaler_file: Path):
-        with open(scaler_file, "rb") as f:
-            scalers = pickle.load(f)
-            self.node_scaler = scalers["node_scaler"]
-            self.edge_scaler = scalers["edge_scaler"]
+        self.node_scaler = _load_scaler(scaler_file, "node_scaler")
+        self.edge_scaler = _load_scaler(scaler_file, "edge_scaler")
 
         self.node_continuous_indices = [
             -4,
@@ -1044,9 +1101,7 @@ class ConnectedGraphFeatureScaler:
 
 class UnconnectedGraphFeatureScaler:
     def __init__(self, scaler_file: Path):
-        with open(scaler_file, "rb") as f:
-            scalers = pickle.load(f)
-            self.protein_node_scaler = scalers["protein_node_scaler"]
+        self.protein_node_scaler = _load_scaler(scaler_file, "protein_node_scaler")
 
         self.node_continuous_indices = [
             -4,
@@ -1157,6 +1212,24 @@ class LigandFeatureGenerator:
                 f"Expected a vector of length 209, got {len(rdkit_vector)}."
             )
 
+        if np.isnan(rdkit_vector).any():
+            missing_descriptors = [
+                desc
+                for desc, is_missing in zip(
+                    all_descriptor_names, np.isnan(rdkit_vector)
+                )
+                if is_missing
+            ]
+            msg = (
+                f"Found {len(missing_descriptors)} missing values in RDKit "
+                f"feature vector: {missing_descriptors}",
+            )
+            logger.error(
+                msg,
+                extra={"missing_descriptors": missing_descriptors},
+            )
+            raise RuntimeError(msg)
+
         return rdkit_vector
 
     @staticmethod
@@ -1177,19 +1250,20 @@ class LigandFeatureGenerator:
         logger.info("Scaling RDKit vector")
 
         # Load the pre-trained scaler
-        with open(scaler_file, "rb") as f:
-            rdkit_scaler = pickle.load(f)["rdkit_scaler"]
+        rdkit_scaler = _load_scaler(scaler_file, "rdkit_scaler")
 
         # Ensure the vector is 2D for the scaler
         if rdkit_vector.ndim == 1:
             rdkit_vector = rdkit_vector.reshape(1, -1)
 
         # Scale the vector
-        standardized_vector = rdkit_scaler.transform(rdkit_vector)
+        standardized_vector = cast(npt.NDArray, rdkit_scaler.transform(rdkit_vector))
 
         # Handle NaN values by replacing them with the corresponding mean
         if np.isnan(standardized_vector).any():
-            feature_means = rdkit_scaler.mean_  # Means of the features from the scaler
+            feature_means = cast(
+                npt.NDArray, rdkit_scaler.mean_
+            )  # Means of the features from the scaler
             standardized_vector = np.where(
                 np.isnan(standardized_vector), feature_means, standardized_vector
             )
@@ -1219,22 +1293,26 @@ class LigandFeatureGenerator:
         """
         logger.info("Scaling transformer embedding")
         # Load the pre-trained scaler
-        with open(scaler_file, "rb") as f:
-            roberta_scaler = pickle.load(f)["roberta_scaler"]
+        roberta_scaler = _load_scaler(scaler_file, "roberta_scaler")
 
         # Ensure the embedding is 2D for the scaler
         if transformer_vector.ndim == 1:
             transformer_vector = transformer_vector.reshape(1, -1)
 
         # Scale the vector
-        standardized_vector = roberta_scaler.transform(transformer_vector)
+        standardized_vector = cast(
+            npt.NDArray, roberta_scaler.transform(transformer_vector)
+        )
 
         # Squeeze back to 1D array if applicable
         return standardized_vector.squeeze()
 
     @staticmethod
     def _get_transformer_vector(
-        rdkit_mol: Mol, transformer_feature_extractor: TransformerFeatureExtractor
+        *,
+        transformer_feature_extractor: TransformerFeatureExtractor,
+        smiles: str | None = None,
+        rdkit_mol: Mol | None = None,
     ) -> np.ndarray:
         """
         Given a ligand RDKit molecule, extract a transformer-based feature vector using a pretrained
@@ -1246,20 +1324,44 @@ class LigandFeatureGenerator:
         - Return the feature vector as a NumPy array.
 
         Args:
-            rdkit_mol: RDKit molecule object.
-            transformer_feature_extractor: An initialized transformer feature extractor object
-                                        with a method `extract_features(smiles: str) -> np.ndarray`.
+            transformer_feature_extractor: An initialized transformer feature
+                extractor object with a method
+                `extract_features(smiles: str) -> np.ndarray`.
+            smiles: The SMILES string. If given, takes precedence over
+                extracting the canoncial SMILES from the RDKit mol instance.
+            rdkit_mol: RDKit molecule object, used to extract the SMILES string.
 
         Returns:
             A 1D NumPy array containing the extracted feature vector.
         """
+        if smiles is None and rdkit_mol is None:
+            raise ValueError("One of smiles and rdkit_mol must be given.")
+
         logger.info("Extracting transformer features from SMILES")
 
-        # Convert to canonical SMILES
-        canonical_smiles = MolToSmiles(rdkit_mol, canonical=True)
+        if smiles:
+            mol = MolFromSmiles(smiles)
+            canonical_smiles = MolToSmiles(mol, canonical=True)
+        else:
+            # Convert to canonical SMILES
+            canonical_smiles = MolToSmiles(rdkit_mol, canonical=True)
 
         # Extract features using the transformer model
-        features = transformer_feature_extractor.extract_features(canonical_smiles)
+        try:
+            features = transformer_feature_extractor.extract_features(canonical_smiles)
+        except KeyError as e:
+            logger.warning(
+                f"Failed looking up vocabulary: {e}, trying without stereochemistry."
+            )
+            # Remove steriochemistry
+            # NOTE(Philipp): maybe spend at some point more time here, or re-visit
+            # when retraining this part of the model. Some components of SMILES
+            # strings did not make it into vocab. I was specifically running into
+            # some issues with the `/` and `\` stereochemistry symbols
+            rdkit_mol = copy.deepcopy(rdkit_mol)
+            RemoveStereochemistry(rdkit_mol)
+            canonical_smiles = MolToSmiles(rdkit_mol, canonical=True)
+            features = transformer_feature_extractor.extract_features(canonical_smiles)
 
         # Ensure the result is a NumPy array
         if not isinstance(features, np.ndarray):
@@ -1267,11 +1369,18 @@ class LigandFeatureGenerator:
 
         return features
 
-    def from_molecule(self, molecule: Molecule) -> "LigandFeatures":
-        rdkit_mol = pybel_mol_to_rdkit_mol(molecule)
+    def from_molecule(
+        self,
+        molecule: Molecule,
+        rdkit_mol: Chem.Mol,
+        smiles: str | None = None,
+    ) -> "LigandFeatures":
+        molecule = safely_remove_hydrogens(molecule)
         rdkit_vector = self._get_rdkit_vector(rdkit_mol)
         transformer_vector = self._get_transformer_vector(
-            rdkit_mol, self.transformer_feature_extractor
+            transformer_feature_extractor=self.transformer_feature_extractor,
+            smiles=smiles,
+            rdkit_mol=rdkit_mol,
         )
 
         # Scale the SMILES transformer encoder embedding
@@ -1349,8 +1458,7 @@ class ProteinFeatures(BaseModel):
 
 class ProteinSequenceScaler:
     def __init__(self, scaler_file: Path):
-        with open(scaler_file, "rb") as f:
-            self.esm2_scaler = pickle.load(f)["esm2_scaler"]
+        self.esm2_scaler = _load_scaler(scaler_file, "esm2_scaler")
 
     def scale_esm2_embedding(self, esm2_embedding: np.ndarray) -> np.ndarray:
         """
@@ -1375,7 +1483,9 @@ class ProteinSequenceScaler:
             esm2_embedding = esm2_embedding.reshape(1, -1)
 
         # Scale the embedding
-        standardized_embedding = self.esm2_scaler.transform(esm2_embedding)
+        standardized_embedding = cast(
+            npt.NDArray, self.esm2_scaler.transform(esm2_embedding)
+        )
 
         # Return as a 1D array if it was originally 1D
         if standardized_embedding.shape[0] == 1:
@@ -1389,7 +1499,7 @@ class ProteinFeatureGenerator:
     unconnected_graph_scaler_name: ClassVar[str] = "unconnected_graph_scaler.pkl"
     protein_sequence_scaler_name: ClassVar[str] = "protein_sequence_scaler.pkl"
 
-    def __init__(self, esm_model_name: ESMModel, device: str):
+    def __init__(self, esm_model_name: ESMModel, device: str, use_cache: bool = True):
         self.esm_model_name = esm_model_name
         self.device = device
         self.connected_featurizer = GraphFeaturizer(surface_features_bool=False)
@@ -1417,10 +1527,25 @@ class ProteinFeatureGenerator:
             )
 
         logger.info(f"Loading ESM2 model from huggingface: {esm_model_name}")
-        self.esm_model, self.esm_alphabet = torch.hub.load(
-            "facebookresearch/esm:main", esm_model_name.value
+        # TODO(philipp): pretty sure we are only running ESM2 on CPU currently, enable GPU inference
+        if use_cache:
+            self.esm_model, self.esm_alphabet, self.esm_batch_converter = (
+                load_esm_model_with_cache(self.esm_model_name.value)
+            )
+        else:
+            self.esm_model, self.esm_alphabet, self.esm_batch_converter = (
+                load_esm_model(self.esm_model_name.value)
+            )
+
+    def __hash__(self) -> int:
+        # NOTE: required for making LRU cache working on `_get_esm2_embedding`
+        return hash((self.esm_model_name.value, self.device))
+
+    def __eq__(self, other) -> bool:
+        # NOTE: required for making LRU cache working on `_get_esm2_embedding`
+        return (
+            self.esm_model_name == other.esm_model_name and self.device == other.device
         )
-        self.esm_batch_converter = self.esm_alphabet.get_batch_converter()
 
     @staticmethod
     def _protein_mol_to_seq(protein_molecule: Molecule) -> str:
@@ -1454,16 +1579,23 @@ class ProteinFeatureGenerator:
 
         return seq
 
+    @functools.lru_cache()
     def _get_esm2_embedding(self, seq: str) -> np.ndarray:
-        """
-        Given a protein sequence across all protein chains, produce the ESM2 embedding for
-        that combined sequence.
+        """Calculate ESM2 embedding vector.
+
+        Given a protein sequence across all protein chains, produce the ESM2
+        embedding for that combined sequence.
 
         This function:
         - Loads the ESM2 model and alphabet as done in the CSV-based code.
         - Converts the sequence into tokens with the model's batch_converter.
         - Runs the ESM2 model to obtain the per-residue representations.
         - Computes the average over residues to obtain a single embedding vector.
+
+        The function has a cache. The cache is shared between different
+        instances of ProteinFeatureGenerator as long as the input arguments are
+        identical. This is mainly useful in a scenarion when running many
+        ligands against a small number of proteins.
 
         Returns:
         A 1D NumPy array containing the ESM2 embedding vector.
@@ -1475,12 +1607,12 @@ class ProteinFeatureGenerator:
         - The ESM2 model weights will be automatically downloaded by torch.hub if not cached.
         """
         # Convert the single protein sequence into tokens
-        logger.info("Converting protein sequence into tokens")
+        logger.info(f"Converting protein sequence of length {len(seq)} into tokens")
         _, _, batch_tokens = self.esm_batch_converter([("1", seq)])
         batch_lens = (batch_tokens != self.esm_alphabet.padding_idx).sum(1)
 
         # Run the model to get embeddings from layer 33 as done previously
-        logger.info("Running ESM2 model to get embeddings from layer 33")
+        logger.debug("Running ESM2 model to get embeddings from layer 33")
         self.esm_model.eval()
         with torch.no_grad():
             results = self.esm_model(
@@ -1502,6 +1634,11 @@ class ProteinFeatureGenerator:
         ligand_molecule: Molecule,
         neighbor_radius: float = 8,
     ) -> Molecule:
+        """Extract protein pocket from protein-ligand pair.
+
+        The extracted pocket still has hydrogen atoms attached (necessary for
+        surface calculations.)
+        """
         logger.info("Identifying protein pocket")
 
         # Load the protein and ligand molecules into biopandas objects
@@ -1546,7 +1683,7 @@ class ProteinFeatureGenerator:
         ligand_nonh = ligand[ligand["atom_type"] != "H"].reset_index(drop=True)
 
         # create ligand non-H atom dictionary
-        ligand_nonh_dict = ligand_nonh.to_dict("index")
+        ligand_nonh_dict = ligand_nonh.to_dict("index")  # type: ignore
 
         # initialize lists to save IDs for residues and heteroatoms to keep in pocket file
         pocket_residues = []
@@ -1679,28 +1816,64 @@ class ProteinFeatureGenerator:
         return pocket_molecule
 
     def from_molecule(
-        self, full_protein_molecule: Molecule, ligand_molecule: Molecule
+        self,
+        full_protein_molecule: Molecule,
+        ligand_molecule: Molecule,
+        sequence: str | None = None,
     ) -> ProteinFeatures:
-        sequence = self._protein_mol_to_seq(full_protein_molecule)
+        if sequence is None:
+            sequence = self._protein_mol_to_seq(full_protein_molecule)
+
         esm2_embedding = self._get_esm2_embedding(sequence)
 
         pocket_protein_molecule = self._extract_protein_pocket(
-            full_protein_molecule, ligand_molecule
+            full_protein_molecule.clone, ligand_molecule.clone
         )
 
         pocket_conn_node_features, pocket_conn_node_coords = (
             self.connected_featurizer.get_node_features(
-                pocket_protein_molecule, source="protein", complex_bool=False
+                pocket_protein_molecule.clone, source="protein", complex_bool=False
             )
         )
         pocket_conn_edge_ids, pocket_conn_edge_attrs = map(
             np.array,
-            self.connected_featurizer.get_bond_based_edges(pocket_protein_molecule),
+            self.connected_featurizer.get_bond_based_edges(
+                pocket_protein_molecule.clone
+            ),
         )
         complex_pocket_conn_node_features, complex_pocket_conn_node_coords = (
             self.connected_featurizer.get_node_features(
-                pocket_protein_molecule, source="protein", complex_bool=True
+                pocket_protein_molecule.clone, source="protein", complex_bool=True
             )
+        )
+
+        # assert that feature and coord vectors have the expected length
+        pocket_protein_molecule_wo_hydrogen = safely_remove_hydrogens(
+            pocket_protein_molecule
+        )
+        expected_pocket_protein_atoms = (
+            pocket_protein_molecule_wo_hydrogen.OBMol.NumAtoms()
+        )
+        expected_pocket_coords = np.asarray(
+            [a.coords for a in pocket_protein_molecule_wo_hydrogen]
+        )
+        assert (
+            expected_pocket_protein_atoms
+            == pocket_conn_node_features.shape[0]
+            == pocket_conn_node_coords.shape[0]
+        )
+        assert (
+            expected_pocket_protein_atoms
+            == complex_pocket_conn_node_features.shape[0]
+            == complex_pocket_conn_node_coords.shape[0]
+        )
+        assert np.allclose(
+            expected_pocket_coords,
+            pocket_conn_node_coords,
+        )
+        assert np.allclose(
+            expected_pocket_coords,
+            complex_pocket_conn_node_coords,
         )
 
         full_unconn_node_features, full_unconn_node_coords = (
@@ -1784,6 +1957,13 @@ class ComplexFeatureGenerator:
             protein_features.unscaled_complex_features,
             protein_features.complex_coords,
         )
+        assert ligand_node_features.shape[0] == ligand_coords.shape[0]
+        assert protein_node_features.shape[0] == protein_coords.shape[0]
+
+        protein_molecule = safely_remove_hydrogens(protein_features.pocket_molecule)
+        ligand_molecule = safely_remove_hydrogens(ligand_features.molecule)
+        assert protein_node_features.shape[0] == protein_molecule.OBMol.NumAtoms()
+        assert ligand_node_features.shape[0] == ligand_molecule.OBMol.NumAtoms()
 
         complex_node_features = np.concatenate(
             (protein_node_features, ligand_node_features), axis=0
@@ -1791,7 +1971,7 @@ class ComplexFeatureGenerator:
         complex_coords = np.concatenate((protein_coords, ligand_coords), axis=0)
         complex_edge_ids, complex_edge_attrs = (
             self.connected_featurizer.get_protein_ligand_complex_edges(
-                protein_features.pocket_molecule, ligand_features.molecule
+                protein_molecule, ligand_molecule
             )
         )
 
@@ -2048,71 +2228,149 @@ class TAlphaDatasetLoader:
         self.protein_surface_feature_generator = ProteinSurfaceFeatureGenerator(device)
 
     def from_single_protein(
-        self, protein_molecule: Molecule, ligand_molecules: list[Molecule]
+        self,
+        protein_molecule: Molecule,
+        openbabel_ligand: Molecule,
+        rdkit_ligand: Chem.Mol,
+        protein_sequence: str | None = None,
+        smiles: str | None = None,
     ) -> list[dict]:
         logger.info("Generating protein features...")
+        # TODO(philipp): think about whether this could be an issue for
+        # evaluating multiple poses/different ligands against a single target.
+        # I currently think it is an issue, because we are extracting the pocket
+        # based on the molecule and this could be different between different
+        # ligands/poses
         protein_features = self.protein_feature_generator.from_molecule(
-            protein_molecule, ligand_molecules[0]
+            protein_molecule, openbabel_ligand, sequence=protein_sequence
         )
 
         data_list = []
-        for ligand_molecule in ligand_molecules:
-            logger.info(f"Generating ligand features for {ligand_molecule.title}")
-            try:
-                data = self._collate_data_single_pair(protein_features, ligand_molecule)
-                data_list.append(data)
-            except Exception as e:
-                logger.error(
-                    f"Error generating ligand features for {ligand_molecule.title}: {e}"
-                )
-                continue
+        data = self._collate_data_single_pair(
+            protein_features,
+            openbabel_ligand,
+            rdkit_ligand,
+            smiles=smiles,
+        )
+        data_list.append(data)
 
         logger.info(f"Generated {len(data_list)} protein-ligand pairs")
         return data_list
 
     def from_multiple_proteins(
-        self, protein_molecules: list[Molecule], ligand_molecules: list[Molecule]
-    ) -> list[dict]:
-        data_list = []
-        for protein_molecule, ligand_molecule in zip(
-            protein_molecules, ligand_molecules
+        self,
+        protein_molecules: list[Molecule | None],
+        openbabel_ligands: list[Molecule | None],
+        rdkit_ligands: list[Chem.Mol | None],
+        protein_sequences: list[str | None] | None = None,
+        smiles_list: list[str | None] | None = None,
+    ) -> list[dict | None]:
+        """Featurize multiple systems in batch.
+
+        `protein_molecules`, `openbabel_ligands` and `rdkit_ligands` are
+        required inputs. The function accepts missing inputs, but will not
+        attempt the featurization.
+
+        Args:
+          protein_molecules: The OpenBabel protein molecules.
+          openbabel_ligands: The OpenBabel ligand molecules.
+          rdkit_ligands: The RDKit ligand molecules.
+          protein_sequences: The list of protein sequences for the system. While
+            this input is optional, it is recommended to give the full protein
+            sequence of the system under investigation. For each missing input,
+            the sequence will be extracted from the protein molecule, which tends
+            to negatively impact performance.
+          smiles_list: The list of canonical SMILES strings for the given ligand.
+            While this input is optional, it is recommended to pass in the
+            expected SMILES string for optimal performance. If not given will be
+            extracted from the RDKit molecule.
+
+        Returns:
+          List of extracted features. If any of the required inputs are missing
+          or if featurization is failing, the respective element in the output
+          list is set to None.
+        """
+        # process inputs
+        if protein_sequences is None:
+            protein_sequences = [None for _ in range(len(protein_molecules))]
+        if smiles_list is None:
+            smiles_list = [None for _ in range(len(protein_molecules))]
+
+        # validate matching lengths
+        if (
+            not len(protein_molecules)
+            == len(openbabel_ligands)
+            == len(rdkit_ligands)
+            == len(protein_sequences)
+            == len(smiles_list)
         ):
+            raise ValueError("Expected all inputs to be of same length.")
+
+        data_list = []
+        for (
+            protein_molecule,
+            openbabel_ligand,
+            rdkit_ligand,
+            protein_sequence,
+            smiles,
+        ) in zip(
+            protein_molecules,
+            openbabel_ligands,
+            rdkit_ligands,
+            protein_sequences,
+            smiles_list,
+        ):
+            # robustness to missing inputs
+            if (
+                protein_molecule is None
+                or openbabel_ligand is None
+                or rdkit_ligand is None
+            ):
+                logger.debug("missing inputs, ")
+                data_list.append(None)
+                continue
+
             try:
                 logger.info(f"Generating protein features for {protein_molecule.title}")
                 protein_features = self.protein_feature_generator.from_molecule(
-                    protein_molecule, ligand_molecule
+                    protein_molecule, openbabel_ligand, sequence=protein_sequence
                 )
 
-                logger.info(f"Generating ligand features for {ligand_molecule.title}")
-                data = self._collate_data_single_pair(protein_features, ligand_molecule)
+                logger.info(f"Generating ligand features for {openbabel_ligand.title}")
+                data = self._collate_data_single_pair(
+                    protein_features,
+                    ligand_molecule=openbabel_ligand,
+                    rdkit_ligand_molecule=rdkit_ligand,
+                    smiles=smiles,
+                )
                 data_list.append(data)
             except Exception as e:
-                logger.error(
-                    f"Error generating ligand features for {ligand_molecule.title}: {e}"
+                logger.exception(
+                    f"Error generating ligand features for protein "
+                    f"{protein_molecule.title} and ligand "
+                    f"{openbabel_ligand.title}: {e}"
                 )
-                continue
+                data_list.append(None)
 
         logger.info(f"Generated {len(data_list)} protein-ligand pairs")
         return data_list
 
     def _collate_data_single_pair(
-        self, protein_features: ProteinFeatures, ligand_molecule: Molecule
-    ) -> dict | None:
+        self,
+        protein_features: ProteinFeatures,
+        ligand_molecule: Molecule,
+        rdkit_ligand_molecule: Chem.Mol,
+        smiles: str | None = None,
+    ) -> dict:
         atom_coords_batch = torch.zeros(
             protein_features.full_coords.shape[0],  # Changed from size(0)
             dtype=torch.long,
             device=self.device,
         )
 
-        try:
-            ligand_features = self.ligand_feature_generator.from_molecule(
-                ligand_molecule
-            )
-        except ValueError as e:
-            logger.error(
-                f"Error generating ligand features for {ligand_molecule.title}: {e}"
-            )
-            return None
+        ligand_features = self.ligand_feature_generator.from_molecule(
+            ligand_molecule, rdkit_ligand_molecule, smiles=smiles
+        )
 
         complex_features = self.complex_feature_generator.from_ligand_protein_features(
             ligand_features, protein_features
@@ -2463,7 +2721,7 @@ def get_device() -> str:
 
 def score_data(
     t_alpha_model_file: Path,
-    data_list: list[dict],
+    data_list: list[dict | None],
     batch_size: int = 1,
     device: str | None = None,
 ) -> np.ndarray:
@@ -2472,6 +2730,7 @@ def score_data(
 
     # Update keys in parameter file
     with tempfile.TemporaryDirectory() as temp_dir:
+        # TODO(philipp) write this file to cache to avoid re-running this
         tmp_ckpt_path = Path(temp_dir) / "updated_T-ALPHA_params.ckpt"
         update_parameter_keys(t_alpha_model_file, tmp_ckpt_path)
 
@@ -2502,7 +2761,7 @@ def score_data(
             outputs = []
             for data in data_list:
                 if data is None:
-                    outputs.append(None)
+                    outputs.append(np.nan)
                 else:
                     output = lightning_model.model(data)
                     outputs.append(output.cpu().numpy().flatten()[0])
@@ -2521,47 +2780,13 @@ def embed_pybel_mol(mol: Molecule) -> Molecule | None:
     return pybel_mol_from_rdkit_mol(rdkit_mol)
 
 
-# def score_compounds_single_protein_from_files(
-#     protein_file: Path,
-#     ligand_file: Path,
-#     esm_model_name: ESMModel,
-#     device: str | None = None,
-#     batch_size: int = 1,
-#     t_alpha_model_file: Path = DEFAULT_T_ALPHA_MODEL_FILE,
-#     smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
-# ) -> npt.NDArray[np.float_]:
-#     # Add hydrogens to the protein
-#     protein_molecule = next(pybel.readfile("pdb", str(protein_file)))
-#     protein_molecule.OBMol.AddHydrogens()
-
-#     # Add hydrogens to the ligand
-#     ligand_format = ligand_file.suffix.lstrip(".")
-#     ligand_mols = []
-#     for ligand_molecule in list(pybel.readfile(ligand_format, str(ligand_file))):
-#         embedded_ligand = embed_pybel_mol(ligand_molecule)
-#         if embedded_ligand is None:
-#             continue
-#         ligand_mols.append(embedded_ligand)
-
-#     logger.info(
-#         f"Loaded protein with {len(protein_molecule.atoms)} atoms and "
-#         f"{len(ligand_mols)} ligands"
-#     )
-
-#     return score_compounds_single_protein(
-#         protein_molecule=protein_molecule,
-#         ligand_molecules=ligand_mols,
-#         esm_model_name=esm_model_name,
-#         device=device,
-#         batch_size=batch_size,
-#         t_alpha_model_file=t_alpha_model_file,
-#         smiles_transformer_model_file=smiles_transformer_model_file,
-#     )
-
-
 def generate_features(
-    protein: Molecule | list[Molecule],
-    ligands: list[Molecule],
+    *,
+    protein: Molecule,
+    openbabel_ligand: Molecule,
+    rdkit_ligand: Chem.Mol,
+    protein_sequence: str | None = None,
+    smiles: str | None = None,
     esm_model_name: ESMModel = ESMModel.ESM2_T36_3B_UR50D,
     device: str | None = None,
     smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
@@ -2575,16 +2800,43 @@ def generate_features(
         smiles_transformer_model_file=smiles_transformer_model_file,
     )
 
-    if isinstance(protein, Molecule):
-        return dataset_loader.from_single_protein(
-            protein_molecule=protein,
-            ligand_molecules=ligands,
-        )
-    else:
-        return dataset_loader.from_multiple_proteins(
-            protein_molecules=protein,
-            ligand_molecules=ligands,
-        )
+    return dataset_loader.from_single_protein(
+        protein_molecule=protein,
+        openbabel_ligand=openbabel_ligand,
+        rdkit_ligand=rdkit_ligand,
+        protein_sequence=protein_sequence,
+        smiles=smiles,
+    )
+
+
+# TODO wrap input into dataclass for simpler logic
+def generate_features_in_batch(
+    *,
+    proteins: list[Molecule | None],
+    openbabel_ligands: list[Molecule | None],
+    rdkit_ligands: list[Chem.Mol | None],
+    protein_sequences: list[str | None] | None = None,
+    smiles_list: list[str | None] | None = None,
+    esm_model_name: ESMModel = ESMModel.ESM2_T36_3B_UR50D,
+    device: str | None = None,
+    smiles_transformer_model_file: Path = DEFAULT_SMILES_TRANSFORMER_MODEL_FILE,
+) -> list[dict | None]:
+    logger.info("Generating T-ALPHA features...")
+    device = device or get_device()
+
+    dataset_loader = TAlphaDatasetLoader(
+        esm_model_name=esm_model_name,
+        device=device,
+        smiles_transformer_model_file=smiles_transformer_model_file,
+    )
+
+    return dataset_loader.from_multiple_proteins(
+        protein_molecules=proteins,
+        openbabel_ligands=openbabel_ligands,
+        rdkit_ligands=rdkit_ligands,
+        protein_sequences=protein_sequences,
+        smiles_list=smiles_list,
+    )
 
 
 def create_or_load_smiles_transformer_vocab(
@@ -2603,9 +2855,12 @@ def create_or_load_smiles_transformer_vocab(
         else:
             logger.info("Generating SMILES vocabulary")
             with smart_open(smiles_transformer_vocab_file, "wt") as f:
-                smiles_list = pd.read_parquet(smiles_transformer_training_data_file)[
-                    "SMILES"
-                ].tolist()
+                smiles_list = cast(
+                    list[str],
+                    pd.read_parquet(smiles_transformer_training_data_file)[
+                        "SMILES"
+                    ].tolist(),
+                )
 
                 smiles_transformer_vocab = SMILESTransformerVocab.from_smiles(
                     smiles_list
@@ -2613,3 +2868,52 @@ def create_or_load_smiles_transformer_vocab(
                 f.write(smiles_transformer_vocab.model_dump_json())
 
     return smiles_transformer_vocab
+
+
+def safely_remove_hydrogens(mol: Molecule) -> Molecule:
+    mol = mol.clone
+    n_atoms_before = mol.OBMol.NumAtoms()
+
+    mol.OBMol.DeleteHydrogens()
+
+    h_atoms_remaining = [atom for atom in mol if atom.atomicnum == 1]
+    if h_atoms_remaining:
+        logger.warning(
+            f"Found {len(h_atoms_remaining)} hydrogen atoms after calling "
+            f"`DeleteHydrogens`, trying manual deletion..."
+        )
+
+        for h_atom in h_atoms_remaining:
+            mol.OBMol.DeleteAtom(h_atom.OBAtom)
+
+    if sum(atom.atomicnum == 1 for atom in mol):
+        raise ValueError("Manual deletion of hydrogen atoms was unsuccessful.")
+
+    n_atoms_after = mol.OBMol.NumAtoms()
+
+    logger.debug(f"Removed {n_atoms_before - n_atoms_after} hydrogens from molecule.")
+    return mol
+
+
+def load_esm_model(esm_model_name: str) -> tuple[Any, Any, Any]:
+    """Load the ESM model and alphabet."""
+    esm_model, esm_alphabet = cast(
+        tuple[Any, Any], torch.hub.load("facebookresearch/esm:main", esm_model_name)
+    )
+    esm_batch_converter = esm_alphabet.get_batch_converter()
+
+    return esm_model, esm_alphabet, esm_batch_converter
+
+
+@functools.cache
+def load_esm_model_with_cache(esm_model_name: str) -> tuple[Any, Any, Any]:
+    """Load the ESM model and alphabet with in-memory cache."""
+    return load_esm_model(esm_model_name)
+
+
+@functools.cache
+def _load_scaler(scaler_file: Path, scaler_name: str) -> StandardScaler:
+    # TODO: long term, probably move the scalers to ONNX
+    with open(scaler_file, "rb") as f:
+        scalers = pickle.load(f)
+        return scalers[scaler_name]

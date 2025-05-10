@@ -33,7 +33,7 @@ class MetaModelDataset(Dataset):
     def __len__(self):
         return len(self.keys)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Data:
         with h5py.File(self.data_h5_file, "r") as f:
             group = self.keys[idx]
             atom_coords = f[group]["protein_nodes_withH_coords"][:]

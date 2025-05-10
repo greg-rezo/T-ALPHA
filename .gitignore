@@ -6,3 +6,6 @@ T-ALPHA_params.ckpt
 SMILES_transformer_params.pt
 SMILES_transformer_pretraining_data.csv
 SMILES_transformer_pretraining_data.parquet
+.ipynb_checkpoints
+*.egg-info/
+*.egg
